@@ -12,6 +12,7 @@ class EventRecord(BaseModel):
     """Immutable audit record of runtime agent interactions."""
     event_id: str
     event_type: str
+    thread_id: str = ""
     timestamp: str
     session_id: str
     user_id: str
@@ -38,6 +39,7 @@ class EventLogger:
             event_type=event_data["event_type"],
             timestamp=timestamp,
             session_id=event_data["session_id"],
+            thread_id=event_data.get("thread_id") or "",
             user_id=event_data["user_id"],
             agent_id=event_data.get("agent_id", "system"),
             payload=event_data.get("payload", {}),
@@ -50,6 +52,30 @@ class EventLogger:
 
         logger.debug(f"[EventLogger] Persisted {record.event_type} ({record.event_id})")
         return record
+
+    def get_events_for_thread(
+        self,
+        thread_id: str,
+        event_types: Optional[List[str]] = None
+    ) -> List[EventRecord]:
+        """Get ALL events in a thread (across all sessions)."""
+        all_events = []
+
+        for path in self.base_path.glob("*.jsonl"):
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    stripped = line.strip()
+                    if not stripped:
+                        continue
+                    event = EventRecord.model_validate_json(stripped)
+                    if event.thread_id != thread_id:
+                        continue
+                    if event_types and event.event_type not in event_types:
+                        continue
+                    all_events.append(event)
+
+        all_events.sort(key=lambda e: e.timestamp)
+        return all_events
 
     def get_events(
         self,

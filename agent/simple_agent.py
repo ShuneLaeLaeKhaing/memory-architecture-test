@@ -1,9 +1,10 @@
 """Simple Agent: Assembles memory context without graph orchestration overhead."""
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 from loguru import logger
 import openai
 
+from memory.event_capture import EventLogger
 from memory.llm import llm_client, llm_model_fast, llm_no_thinking
 from memory.retrieval import MemoryRetriever
 
@@ -11,18 +12,32 @@ from memory.retrieval import MemoryRetriever
 class SimpleAgent:
     """Direct LLM execution harness incorporating authoritative memory context."""
 
-    def __init__(self, agent_config: Dict[str, Any], retriever: MemoryRetriever):
+    def __init__(
+        self,
+        agent_config: Dict[str, Any],
+        retriever: MemoryRetriever,
+        event_logger: Optional[EventLogger] = None,
+    ):
         self.config = agent_config
         self.retriever = retriever
+        self.event_logger = event_logger or EventLogger()
 
-    def respond(self, user_message: str, user_id: str, session_id: str) -> str:
-        """Retrieves targeted memory across stores and streams LLM completion."""
+    def respond(
+        self, 
+        user_message: str, 
+        user_id: str, 
+        session_id: str,
+        thread_id: Optional[str] = None
+    ) -> str:
+        """Retrieves targeted memory and conversation history."""
+        
         scopes = [
             f"user:{user_id}",
             f"agent:{self.config['agent_id']}",
             "shared:organization"
         ]
 
+        # Long-term memory (facts, procedures)
         context = self.retriever.retrieve(
             query=user_message,
             user_id=user_id,
@@ -31,6 +46,7 @@ class SimpleAgent:
         )
 
         formatted_context = self._build_context_prompt(context)
+        
         system_prompt = (
             f"{self.config['role']}\n\n"
             "Operational Guidelines:\n"
@@ -40,20 +56,30 @@ class SimpleAgent:
             "- If you lack sufficient context, be transparent and ask for clarification.\n"
             "- Reply with the user-facing answer only. No analysis, steps, or thinking."
         )
-
+        
+        # Build messages
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "system", "content": f"AUTHORITATIVE CONTEXT:\n{formatted_context}"},
-            {"role": "user", "content": user_message}
         ]
+        
+        # ✅ Thread history (includes all sessions automatically)
+        conversation_history = []
+        if thread_id:
+            conversation_history = self._get_thread_history(
+                thread_id=thread_id,
+                max_messages=10
+            )
+            messages.extend(conversation_history)
+        
+        # Add current message
+        messages.append({"role": "user", "content": user_message})
 
-        logger.debug(f"[SimpleAgent] Invoking OpenAI completion for '{user_message[:30]}...'")
-        # client = openai.OpenAI()
-        # resp = client.chat.completions.create(
-        #     model="gpt-4o-mini",
-        #     messages=messages,
-        #     temperature=0.4
-        # )
+        logger.debug(
+            f"[SimpleAgent] Invoking with {len(conversation_history)} "
+            f"history messages for '{user_message[:30]}...'"
+        )
+        
         client = llm_client()
         resp = client.chat.completions.create(
             model=llm_model_fast(),
@@ -62,7 +88,46 @@ class SimpleAgent:
             max_tokens=600,
             **llm_no_thinking(),
         )
+        
         return resp.choices[0].message.content
+
+    def _get_thread_history(
+        self,
+        thread_id: str,
+        max_messages: int = 10
+    ) -> List[Dict[str, str]]:
+        """
+        Get recent conversation history for this thread.
+        
+        Includes ALL sessions in the thread (no session boundaries).
+        This is how Claude works - thread history persists across browser sessions.
+        
+        Args:
+            thread_id: Thread identifier
+            max_messages: Maximum number of recent messages to retrieve
+        
+        Returns:
+            List of messages in OpenAI format [{"role": "user", "content": "..."}]
+        """
+        events = self.event_logger.get_events_for_thread(
+            thread_id=thread_id,
+            event_types=["user_message", "agent_response"]
+        )
+        
+        messages = []
+        for event in events[-max_messages:]:
+            if event.event_type == "user_message":
+                messages.append({
+                    "role": "user",
+                    "content": event.payload.get("content", "")
+                })
+            elif event.event_type == "agent_response":
+                messages.append({
+                    "role": "assistant",
+                    "content": event.payload.get("content", "")
+                })
+        
+        return messages
 
     def _build_context_prompt(self, context: Dict[str, Any]) -> str:
         """Formats retrieved items into organized Markdown sections for the LLM prompt."""

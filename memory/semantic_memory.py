@@ -6,7 +6,7 @@ import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 from loguru import logger
-from mem0 import MemoryClient  # Changed from Memory
+from mem0 import MemoryClient
 from pydantic import BaseModel, Field
 from memory.key_normalizer import normalize_key, keys_are_same_concept
 
@@ -32,7 +32,6 @@ class SemanticMemory:
     """Manages semantic facts using Mem0 Cloud API."""
 
     def __init__(self):
-        # ✅ Use Mem0 Cloud with API Key
         api_key = os.getenv("MEM0_API_KEY")
         if not api_key:
             raise ValueError(
@@ -66,7 +65,13 @@ class SemanticMemory:
             user_id=user_id,
             scope=scope,
         )
+        
         meta = metadata.copy() if metadata else {}
+        
+        # ✅ FIX: Ensure category goes into metadata, not lost as separate param
+        if category:
+            meta["category"] = category
+        
         meta.update({
             "scope": scope_label,
             "scope_type": kind,
@@ -80,8 +85,6 @@ class SemanticMemory:
             "superseded_by": None,
             "created_at": datetime.utcnow().isoformat(),
         })
-        if category:
-            meta["category"] = category
 
         resp = self.mem0.add(
             messages=[{"role": "user", "content": content}],
@@ -110,7 +113,7 @@ class SemanticMemory:
         )
         self._recent.append(fact)
         logger.info(
-            f"[SemanticMemory] Fact committed: {fact.fact_id} "
+            f"[SemanticMemory] Fact committed: {fact.fact_id[:8]} "
             f"[{kind}:{owner_id}] -> '{content[:40]}...'"
         )
         return fact
@@ -143,7 +146,7 @@ class SemanticMemory:
             supersedes_id=old_fact_id,
         )
         self.mark_superseded(old_fact_id, superseded_by=new_fact.fact_id)
-        logger.info(f"[SemanticMemory] Superseded {old_fact_id} with new fact {new_fact.fact_id}")
+        logger.info(f"[SemanticMemory] Superseded {old_fact_id[:8]} with new fact {new_fact.fact_id[:8]}")
         return new_fact
 
     def search(
@@ -341,10 +344,10 @@ class SemanticMemory:
         return facts
 
     def find_in_recent(
-    self,
-    fact_key: str,
-    scope: str,
-) -> List[SemanticFact]:
+        self,
+        fact_key: str,
+        scope: str,
+    ) -> List[SemanticFact]:
         """Same-session lookup before Mem0 (avoids cloud lag)."""
         if not fact_key:
             return []
@@ -358,30 +361,74 @@ class SemanticMemory:
             )
         ]
 
-    def bump_confidence(self, fact_id: str, extra_episode_id: str, delta: float = 0.05) -> None:
+    def bump_confidence(
+        self,
+        fact_id: str,
+        extra_episode_id: str,
+        delta: float = 0.05,
+        fact: Optional[SemanticFact] = None,
+    ) -> None:
         """Merge action: reinforce an existing fact instead of duplicating."""
-        fact = next((f for f in self._recent if f.fact_id == fact_id), None)
-        if fact is None:
+        target = next((f for f in self._recent if f.fact_id == fact_id), None)
+        if target is None:
+            target = fact
+        if target is None:
+            target = self._load_fact_from_mem0(fact_id)
+        if target is None:
             raise RuntimeError(
-                f"[SemanticMemory] bump failed: {fact_id} not in recent cache"
+                f"[SemanticMemory] bump failed: {fact_id} not in cache or Mem0"
             )
-        new_conf = min(1.0, fact.confidence + delta)
-        episodes = list(dict.fromkeys(fact.source_episode_ids + [extra_episode_id]))
+
+        new_conf = min(1.0, target.confidence + delta)
+        episodes = list(dict.fromkeys(target.source_episode_ids + [extra_episode_id]))
         self._update_and_verify(
             fact_id=fact_id,
-            text=fact.content,
+            text=target.content,
             metadata={
-                **fact.metadata,
+                **target.metadata,
                 "confidence": new_conf,
                 "source_episode_ids": episodes,
             },
-            expected_status=str(fact.metadata.get("status") or "current"),
+            expected_status=str(target.metadata.get("status") or "current"),
         )
-        fact.confidence = new_conf
-        fact.source_episode_ids = episodes
-        fact.metadata["confidence"] = new_conf
-        fact.metadata["source_episode_ids"] = episodes
-        logger.info(f"[SemanticMemory] Bumped confidence of {fact_id} → {new_conf}")
+        target.confidence = new_conf
+        target.source_episode_ids = episodes
+        target.metadata["confidence"] = new_conf
+        target.metadata["source_episode_ids"] = episodes
+        if not any(f.fact_id == fact_id for f in self._recent):
+            self._recent.append(target)
+        logger.info(f"[SemanticMemory] Bumped confidence of {fact_id[:8]} → {new_conf:.2f}")
+
+    def _load_fact_from_mem0(self, fact_id: str) -> Optional[SemanticFact]:
+        """Load one fact from Mem0 when it is not in the same-session cache."""
+        try:
+            raw = self.mem0.get(fact_id)
+        except Exception as exc:
+            logger.warning(f"[SemanticMemory] get({fact_id[:8]}) failed: {exc}")
+            return None
+        if isinstance(raw, list):
+            raw = raw[0] if raw else None
+        if not isinstance(raw, dict):
+            return None
+        meta = _metadata(raw)
+        content = str(raw.get("memory") or raw.get("content") or "")
+        if not content:
+            return None
+        owner = str(meta.get("owner_id") or raw.get("user_id") or "")
+        return SemanticFact(
+            fact_id=fact_id,
+            content=content,
+            user_id=owner,
+            scope=str(meta.get("scope") or _default_scope(raw, owner)),
+            confidence=_as_float(meta.get("confidence"), 1.0),
+            status=str(meta.get("status") or "current"),
+            version=_as_int(meta.get("version"), 1),
+            source_episode_ids=_as_list(meta.get("source_episode_ids")),
+            created_at=str(meta.get("created_at") or datetime.utcnow().isoformat()),
+            created_by=str(meta.get("trigger") or "manual"),
+            supersedes_id=meta.get("supersedes_id"),
+            metadata=meta,
+        )
 
     def supersede_fact(
         self,
@@ -400,11 +447,14 @@ class SemanticMemory:
             scope_type=scope_type,
             scope_id=scope_id,
             confidence=0.95,
-            category=old_fact.metadata.get("category", "general"),
             source_episode_id=source_episode_id,
             trigger=trigger,
             status="current",
-            metadata={"version": old_fact.version + 1, **(extra_metadata or {})},
+            metadata={
+                "version": old_fact.version + 1,
+                "category": old_fact.metadata.get("category", "general"),
+                **(extra_metadata or {})
+            },
             supersedes_id=old_fact.fact_id,
         )
         self.mark_superseded(old_fact.fact_id, superseded_by=new_fact.fact_id)
@@ -414,62 +464,98 @@ class SemanticMemory:
         """
         Mark an existing fact as superseded.
         
-        Mem0 Cloud rejects update() if text is unchanged (409 Conflict).
-        Solution: append a superseded marker to the text so it's different.
+        ✅ FIX: Fetches original content from Mem0 if not in cache.
+        This ensures we have the actual text to modify (Mem0 requires text change to update).
         """
+        # Try cache first
         cached = next((f for f in self._recent if f.fact_id == fact_id), None)
-        original_text = cached.content if cached else ""
-        existing_meta = cached.metadata.copy() if cached else {}
-
-        # Mem0 requires text to actually change or it returns 409.
-        # Append a marker that makes the content unique while preserving meaning.
+        
+        if cached:
+            original_text = cached.content
+            existing_meta = cached.metadata.copy()
+            logger.debug(f"[mark_superseded] Using cached content for {fact_id[:8]}")
+        else:
+            # ✅ NEW: Fetch from Mem0 if not in cache
+            logger.debug(f"[mark_superseded] Fetching {fact_id[:8]} from Mem0 (not in cache)")
+            try:
+                raw = self.mem0.get(fact_id)
+                
+                # Handle both dict and list responses
+                if isinstance(raw, list):
+                    if not raw:
+                        raise ValueError(f"get() returned empty list for {fact_id}")
+                    raw = raw[0]
+                
+                if not isinstance(raw, dict):
+                    raise ValueError(f"get() returned unexpected type: {type(raw)}")
+                
+                original_text = str(raw.get("memory") or raw.get("content") or "")
+                existing_meta = _metadata(raw)
+                
+                if not original_text:
+                    raise ValueError(f"No content found in Mem0 for {fact_id}")
+                
+                logger.debug(
+                    f"[mark_superseded] Fetched content from Mem0: "
+                    f"'{original_text[:50]}...'"
+                )
+                
+            except Exception as exc:
+                logger.error(
+                    f"[mark_superseded] Cannot fetch fact {fact_id[:8]} "
+                    f"from Mem0: {exc}"
+                )
+                raise RuntimeError(
+                    f"Cannot mark {fact_id} as superseded: not in cache "
+                    f"and Mem0 fetch failed: {exc}"
+                ) from exc
+        
+        # Mem0 requires text change to accept update (avoids 409 Conflict)
+        # Prepend a marker that makes content unique while preserving searchability
         superseded_text = f"[SUPERSEDED] {original_text}".strip()
-        # If we don't have the original text (not in cache), use a safe fallback
-        if not original_text:
-            superseded_text = f"[SUPERSEDED:{fact_id[:8]}]"
-
+        
         updated_meta = {
             **existing_meta,
             "status": "superseded",
             "superseded_by": superseded_by,
         }
-
+        
         try:
             self._update_and_verify(
                 fact_id=fact_id,
-                text=superseded_text,      # ← changed text avoids 409
+                text=superseded_text,
                 metadata=updated_meta,
                 expected_status="superseded",
             )
         except Exception as exc:
             logger.error(
-                f"[SemanticMemory] mark_superseded failed for "
-                f"{fact_id[:8]}: {exc}"
+                f"[mark_superseded] Update failed for {fact_id[:8]}: {exc}"
             )
             raise
-
-        # Update local cache
+        
+        # Update local cache if present
         if cached:
             cached.status = "superseded"
             cached.superseded_by = superseded_by
+            cached.content = superseded_text  # ✅ Also update cached content
             cached.metadata["status"] = "superseded"
             cached.metadata["superseded_by"] = superseded_by
-
+        
         logger.info(
             f"[SemanticMemory] Marked {fact_id[:8]} as superseded "
             f"(superseded_by={superseded_by[:8] if superseded_by != 'pending' else 'pending'})"
         )
 
     def _update_and_verify(
-    self,
-    *,
-    fact_id: str,
-    text: str,
-    metadata: Dict[str, Any],
-    expected_status: str,
-    attempts: int = 5,
-    delay_s: float = 0.5,
-) -> None:
+        self,
+        *,
+        fact_id: str,
+        text: str,
+        metadata: Dict[str, Any],
+        expected_status: str,
+        attempts: int = 5,
+        delay_s: float = 0.5,
+    ) -> None:
         """
         Call mem0.update(), then poll until the change is visible.
         Raises RuntimeError if update cannot be confirmed after all attempts.
@@ -481,13 +567,13 @@ class SemanticMemory:
             try:
                 self.mem0.update(fact_id, text=text, metadata=metadata)
                 logger.debug(
-                    f"[SemanticMemory] update({fact_id[:8]}) "
+                    f"[_update_and_verify] update({fact_id[:8]}) "
                     f"call succeeded (attempt {attempt})"
                 )
             except Exception as exc:
                 last_error = exc
                 logger.warning(
-                    f"[SemanticMemory] update({fact_id[:8]}) "
+                    f"[_update_and_verify] update({fact_id[:8]}) "
                     f"attempt {attempt}/{attempts} failed: {exc}"
                 )
                 time.sleep(delay_s)
@@ -499,7 +585,7 @@ class SemanticMemory:
 
             if matched is True:
                 logger.debug(
-                    f"[SemanticMemory] update({fact_id[:8]}) "
+                    f"[_update_and_verify] update({fact_id[:8]}) "
                     f"confirmed status='{expected_status}' "
                     f"after attempt {attempt}"
                 )
@@ -507,36 +593,33 @@ class SemanticMemory:
 
             if matched is False:
                 logger.warning(
-                    f"[SemanticMemory] update({fact_id[:8]}) "
-                    f"not visible yet (attempt {attempt}/{attempts}), retrying"
+                    f"[_update_and_verify] update({fact_id[:8]}) "
+                    f"status mismatch (attempt {attempt}/{attempts}), retrying"
                 )
-                # Loop: try updating again
                 continue
 
             if matched is None:
-                # Could not read back - API issue or fact not found
-                # Don't retry the update, just wait and re-check
+                # Could not read back - Mem0 API issue
+                # Don't retry update, just wait longer and re-check
                 logger.warning(
-                    f"[SemanticMemory] update({fact_id[:8]}) "
+                    f"[_update_and_verify] update({fact_id[:8]}) "
                     f"read-back returned None (attempt {attempt}/{attempts}). "
-                    f"Mem0 get() may not support single-fact fetch. "
                     f"Trusting the update call succeeded."
                 )
-                # If Mem0's .get() API doesn't work reliably,
-                # we fall through and trust the update call itself
-                # This is the pragmatic path - log it, don't block
+                # Pragmatic: if get() doesn't work, trust the update() call
                 return
 
         raise RuntimeError(
-            f"[SemanticMemory] update({fact_id[:8]}) "
+            f"[_update_and_verify] update({fact_id[:8]}) "
             f"could not confirm status='{expected_status}' "
-            f"after {attempts} attempts. Last error: {last_error}")
+            f"after {attempts} attempts. Last error: {last_error}"
+        )
 
     def _status_matches(
-    self,
-    fact_id: str,
-    expected_status: str,
-) -> Optional[bool]:
+        self,
+        fact_id: str,
+        expected_status: str,
+    ) -> Optional[bool]:
         """
         Returns:
             True  - confirmed status matches
@@ -547,100 +630,100 @@ class SemanticMemory:
             raw = self.mem0.get(fact_id)
         except Exception as exc:
             logger.warning(
-                f"[SemanticMemory] get({fact_id[:8]}) failed: {exc}"
+                f"[_status_matches] get({fact_id[:8]}) failed: {exc}"
             )
             return None
 
-        # Mem0 Cloud can return dict OR list - handle both
+        # Mem0 Cloud can return dict OR list
         if isinstance(raw, list):
             if not raw:
                 logger.warning(
-                    f"[SemanticMemory] get({fact_id[:8]}) returned empty list"
+                    f"[_status_matches] get({fact_id[:8]}) returned empty list"
                 )
                 return None
             raw = raw[0]
 
         if not isinstance(raw, dict):
             logger.warning(
-                f"[SemanticMemory] get({fact_id[:8]}) unexpected type: "
-                f"{type(raw)} value={str(raw)[:100]}"
+                f"[_status_matches] get({fact_id[:8]}) unexpected type: "
+                f"{type(raw)}"
             )
             return None
 
-        # Log the full raw response once so you can see exactly what shape
-        # Mem0 is returning - remove after confirming
-        logger.debug(
-            f"[SemanticMemory] get({fact_id[:8]}) raw response keys: "
-            f"{list(raw.keys())}"
-        )
-
-        # Check metadata.status first (your primary storage)
+        # Check metadata.status (primary)
         meta = _metadata(raw)
         status = meta.get("status", "")
 
-        # Fallback: some Mem0 versions put status at top level
+        # Fallback: top-level status field (some Mem0 versions)
         if not status:
             status = str(raw.get("status") or "")
 
         if not status:
             logger.warning(
-                f"[SemanticMemory] get({fact_id[:8]}) has no status field. "
-                f"meta keys={list(meta.keys())} raw keys={list(raw.keys())}"
+                f"[_status_matches] get({fact_id[:8]}) has no status field"
             )
-            # Return None - we genuinely don't know, caller decides
             return None
 
         result = (status == expected_status)
         logger.debug(
-            f"[SemanticMemory] get({fact_id[:8]}) "
+            f"[_status_matches] {fact_id[:8]} "
             f"status='{status}' expected='{expected_status}' match={result}"
         )
         return result
 
-    def diagnose_fact(self, fact_id: str) -> None:
+    def diagnose_fact(self, fact_id: str, user_id: str = "bob") -> None:
         """
-        Call this on a fact_id that should be superseded but isn't.
-        Prints exactly what Mem0 returns so you can fix _status_matches.
+        Diagnostic tool: fetches a fact via multiple paths and prints results.
+        Use this when a fact should be superseded but isn't showing up correctly.
         """
-        logger.info(f"[Diagnose] Fetching fact {fact_id}")
+        logger.info(f"[Diagnose] ========== Diagnosing fact {fact_id} ==========")
 
+        # Check 1: Direct get()
+        logger.info(f"[Diagnose] Test 1: mem0.get('{fact_id}')")
         try:
             raw = self.mem0.get(fact_id)
-            logger.info(f"[Diagnose] get() type: {type(raw)}")
+            logger.info(f"[Diagnose] get() returned type: {type(raw)}")
             logger.info(f"[Diagnose] get() value: {raw}")
+            
+            if isinstance(raw, dict):
+                logger.info(f"[Diagnose] get() keys: {list(raw.keys())}")
+                meta = _metadata(raw)
+                logger.info(f"[Diagnose] metadata.status: {meta.get('status')}")
         except Exception as exc:
             logger.error(f"[Diagnose] get() raised: {exc}")
 
-        logger.info("[Diagnose] Scanning get_all for fact_id...")
+        # Check 2: Scan get_all
+        logger.info(f"[Diagnose] Test 2: Scanning get_all(user_id='{user_id}')")
         try:
-            all_raw = self.mem0.get_all(filters={"user_id": "bob"})
+            all_raw = self.mem0.get_all(filters={"user_id": user_id})
             rows = _rows(all_raw)
             match = next((r for r in rows if str(r.get("id")) == fact_id), None)
             if match:
                 logger.info(f"[Diagnose] Found in get_all: {match}")
+                meta = _metadata(match)
+                logger.info(f"[Diagnose] get_all metadata.status: {meta.get('status')}")
             else:
                 logger.warning(
-                    f"[Diagnose] NOT found in get_all for user:bob. "
-                    f"Total rows returned: {len(rows)}"
+                    f"[Diagnose] NOT found in get_all. "
+                    f"Total rows: {len(rows)}"
                 )
         except Exception as exc:
-            logger.error(f"[Diagnose] get_all scan raised: {exc}")
+            logger.error(f"[Diagnose] get_all raised: {exc}")
 
-        logger.info("[Diagnose] Testing update() round-trip...")
-        try:
-            self.mem0.update(
-                fact_id,
-                text="DIAGNOSTIC_PROBE",
-                metadata={"_probe": True},
-            )
-            logger.info("[Diagnose] update() succeeded")
+        # Check 3: Cache
+        logger.info(f"[Diagnose] Test 3: Checking _recent cache")
+        cached = next((f for f in self._recent if f.fact_id == fact_id), None)
+        if cached:
+            logger.info(f"[Diagnose] Found in cache: status={cached.status}")
+        else:
+            logger.warning(f"[Diagnose] NOT in _recent cache")
 
-            time.sleep(1.0)
-            raw2 = self.mem0.get(fact_id)
-            logger.info(f"[Diagnose] get() after update: {raw2}")
-        except Exception as exc:
-            logger.error(f"[Diagnose] update/re-get raised: {exc}")
+        logger.info(f"[Diagnose] ========== End diagnosis ==========")
 
+
+# ============================================================
+# HELPER FUNCTIONS
+# ============================================================
 
 _SCOPE_FIELD = {
     "user": "user_id",
@@ -708,7 +791,7 @@ def _mem0_filters_for_scopes(
     scopes: List[str],
     legacy_user_id: Optional[str] = None,
 ) -> List[Dict[str, str]]:
-    """One Mem0 filter per owner. Also query user_id for older facts stored there."""
+    """One Mem0 filter per owner."""
     seen = set()
     filters: List[Dict[str, str]] = []
     for scope in scopes:

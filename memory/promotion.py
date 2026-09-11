@@ -55,10 +55,11 @@ class Candidate:
 
 @dataclass
 class PolicyDecision:
-    action: str
+    """Outcome of policy evaluation for a candidate fact."""
+    action: str  # "promote" | "merge" | "supersede" | "discard"
     reason: str
     target: Optional[SemanticFact] = None
-    all_targets: Optional[List[SemanticFact]] = None  # add this
+    all_targets: Optional[List[SemanticFact]] = None
 
     def targets_to_supersede(self) -> List[SemanticFact]:
         """All facts that need to be marked superseded."""
@@ -89,7 +90,7 @@ class PromotionEngine:
     def detect_promotions(self, episodes: List[EpisodeRecord]) -> None:
         """Main entry: process episodes through both pipelines."""
         for episode in episodes:
-            logger.info(f"[Promotion] Episode: {episode.episode_id}")
+            logger.info(f"[Promotion] Processing episode: {episode.episode_id}")
             
             # Index episode for historical retrieval
             self.episodic.index_episode(episode)
@@ -117,6 +118,11 @@ class PromotionEngine:
             return
 
         for cand in candidates[:MAX_CANDIDATES]:
+            logger.debug(
+                f"[Promotion] Processing candidate: '{cand.content[:50]}...' "
+                f"(key={cand.key}, type={cand.fact_type})"
+            )
+            
             # Stage 3: Identity Resolution
             scope_type, scope_id = self.identity_for(cand, episode)
 
@@ -136,44 +142,44 @@ class PromotionEngine:
         
         prompt = f"""Extract durable, specific facts from this episode. Be strict.
 
-        EPISODE:
-        Goal: {ep.goal}
-        Summary: {ep.summary}
-        Lessons: {', '.join(ep.lessons)}
-        User: {ep.user_id}
-        Agent: {ep.agent_id}
+EPISODE:
+Goal: {ep.goal}
+Summary: {ep.summary}
+Lessons: {', '.join(ep.lessons)}
+User: {ep.user_id}
+Agent: {ep.agent_id}
 
-        REQUIREMENTS (ALL must be met):
-        1. SPECIFIC - about {ep.user_id}, this agent, or a named company system/team
-        2. DURABLE - still true next month (not "is currently setting up")
-        3. NON-GENERIC - never general advice
+REQUIREMENTS (ALL must be met):
+1. SPECIFIC - about {ep.user_id}, this agent, or a named company system/team
+2. DURABLE - still true next month (not "is currently setting up")
+3. NON-GENERIC - never general advice
 
-        REJECT (do not extract):
-        - "It's important for new employees to..." (generic)
-        - "Technical setups may require..." (vague)
-        - "New hires should familiarize..." (obvious)
+REJECT (do not extract):
+- "It's important for new employees to..." (generic)
+- "Technical setups may require..." (vague)
+- "New hires should familiarize..." (obvious)
 
-        ACCEPT examples:
-        - "{ep.user_id} prefers MacBook for development" → key: preferred_laptop, value: MacBook
-        - "{ep.user_id}'s manager is Sarah Chen" → key: manager_name, value: Sarah Chen
-        - "IT department uses Microsoft Teams" → key: it_communication_tool, value: Microsoft Teams
+ACCEPT examples:
+- "{ep.user_id} prefers MacBook for development" → key: preferred_laptop, value: MacBook
+- "{ep.user_id}'s manager is Sarah Chen" → key: manager_name, value: Sarah Chen
+- "IT department uses Microsoft Teams" → key: it_communication_tool, value: Microsoft Teams
 
-        OUTPUT JSON:
-        {{
-        "candidates": [
-            {{
-            "content": "Clean standalone sentence, no pronouns",
-            "fact_type": "preference|identity|constraint|lesson|policy",
-            "key": "snake_case_key",
-            "value": "the essential value",
-            "scope_hint": "user|agent|organization",
-            "confidence": 0.85-1.0,
-            "evidence": "quote from episode"
-            }}
-        ]
-        }}
+OUTPUT JSON:
+{{
+  "candidates": [
+    {{
+      "content": "Clean standalone sentence, no pronouns",
+      "fact_type": "preference|identity|constraint|lesson|policy",
+      "key": "snake_case_key",
+      "value": "the essential value",
+      "scope_hint": "user|agent|organization",
+      "confidence": 0.85-1.0,
+      "evidence": "quote from episode"
+    }}
+  ]
+}}
 
-        Return empty array if nothing qualifies."""
+Return empty array if nothing qualifies."""
 
         try:
             client = llm_client()
@@ -195,19 +201,24 @@ class PromotionEngine:
             logger.error(f"[Promotion] Extraction failed: {exc}")
             return []
 
-        return [
-                Candidate(
-                    content=str(c.get("content", "")).strip(),
-                    fact_type=str(c.get("fact_type", "")).strip().lower(),
-                    key=normalize_key(str(c.get("key", "")).strip().lower()),  # ← normalize here
-                    value=str(c.get("value", "")).strip(),
-                    scope_hint=str(c.get("scope_hint", "user")).strip().lower(),
-                    confidence=float(c.get("confidence", 0.0)),
-                    evidence=str(c.get("evidence", ""))
-                )
-                for c in raw
-                if c.get("content")
-            ]
+        candidates = [
+            Candidate(
+                content=str(c.get("content", "")).strip(),
+                fact_type=str(c.get("fact_type", "")).strip().lower(),
+                key=normalize_key(str(c.get("key", "")).strip().lower()),  # ✅ Normalize
+                value=str(c.get("value", "")).strip(),
+                scope_hint=str(c.get("scope_hint", "user")).strip().lower(),
+                confidence=float(c.get("confidence", 0.0)),
+                evidence=str(c.get("evidence", ""))
+            )
+            for c in raw
+            if c.get("content")
+        ]
+        
+        logger.debug(
+            f"[Promotion] Extracted {len(candidates)} candidates from LLM"
+        )
+        return candidates
 
     # ---------- Stage 3: Identity Resolution ----------
 
@@ -225,56 +236,64 @@ class PromotionEngine:
     # ---------- Stage 4: Existing Fact Lookup ----------
 
     def find_existing(
-    self,
-    scope_type: str,
-    scope_id: str,
-    cand: Candidate,
-) -> List[SemanticFact]:
-
+        self,
+        scope_type: str,
+        scope_id: str,
+        cand: Candidate,
+    ) -> List[SemanticFact]:
+        """
+        Multi-pass lookup to find existing facts matching this candidate.
+        
+        Pass 0: Local cache (same-session facts)
+        Pass 1: Mem0 get_all with key matching
+        Pass 2: Mem0 search with content similarity
+        """
+        
         if scope_type in ("organization", "org", "shared"):
             scope_label = "shared:organization"
         else:
             scope_label = f"{scope_type}:{scope_id}"
 
-        # Pass 0: local cache
+        # Pass 0: Local cache (fast path for same-session facts)
         cached = self.semantic.find_in_recent(
             fact_key=cand.key,
             scope=scope_label,
         )
         if cached:
             logger.debug(
-                f"[find_existing] Cache hit key='{cand.key}': "
+                f"[find_existing] Cache hit for key='{cand.key}': "
                 f"{[f.fact_id[:8] for f in cached]}"
             )
             return cached
 
-        # Pass 1: fetch all in scope, match on NORMALIZED key
+        # Pass 1: Fetch all facts in scope, match on NORMALIZED key
         try:
             all_in_scope = self.semantic.get_all_facts(
                 scopes=[scope_label],
-                status=None,
+                status=None,  # Get ALL facts (including superseded for debugging)
             )
         except Exception as exc:
             logger.warning(f"[find_existing] get_all_facts failed: {exc}")
             all_in_scope = []
 
+        # Match using normalized key comparison
         key_matches = [
             f for f in all_in_scope
             if keys_are_same_concept(
                 f.metadata.get("fact_key", ""),
                 cand.key
             )
-            and f.status != "superseded"
+            and f.status != "superseded"  # Exclude superseded from matching
         ]
 
         if key_matches:
             logger.debug(
-                f"[find_existing] Key match (normalized) '{cand.key}': "
-                f"{[(f.fact_id[:8], f.metadata.get('fact_key')) for f in key_matches]}"
+                f"[find_existing] Key match (normalized) for '{cand.key}': "
+                f"{[(f.fact_id[:8], f.metadata.get('fact_key'), f.status) for f in key_matches]}"
             )
             return key_matches
 
-        # Pass 2: content similarity fallback
+        # Pass 2: Content similarity fallback (for facts without fact_key metadata)
         try:
             similarity_matches = self.semantic.search(
                 query=cand.content,
@@ -284,7 +303,16 @@ class PromotionEngine:
                 threshold=0.45,
                 include_org_facts=False,
             )
-            return [f for f in similarity_matches if f.status != "superseded"]
+            active_matches = [f for f in similarity_matches if f.status != "superseded"]
+            
+            if active_matches:
+                logger.debug(
+                    f"[find_existing] Similarity match for '{cand.content[:30]}...': "
+                    f"{[f.fact_id[:8] for f in active_matches]}"
+                )
+            
+            return active_matches
+            
         except Exception as exc:
             logger.warning(f"[find_existing] search fallback failed: {exc}")
             return []
@@ -292,13 +320,22 @@ class PromotionEngine:
     # ---------- Stage 5: Policy Decision ----------
 
     def apply_policy(
-    self,
-    cand: Candidate,
-    existing: List[SemanticFact],
-    ep: EpisodeRecord,
-) -> PolicyDecision:
-
-        # Hard gates
+        self,
+        cand: Candidate,
+        existing: List[SemanticFact],
+        ep: EpisodeRecord,
+    ) -> PolicyDecision:
+        """
+        Decide what to do with this candidate fact.
+        
+        Returns PolicyDecision with action:
+        - "discard": reject fact (fails quality gates)
+        - "promote": create new fact (no conflict)
+        - "merge": reinforce existing fact (same key+value)
+        - "supersede": replace existing fact(s) (key match, different value)
+        """
+        
+        # Hard gates - reject immediately
         if cand.confidence < MIN_CONFIDENCE:
             return PolicyDecision(
                 "discard",
@@ -318,35 +355,39 @@ class PromotionEngine:
         if not self._is_specific_enough(cand, ep):
             return PolicyDecision("discard", "not specific to user/agent/organization")
 
-        # No existing fact
+        # No existing fact - promote as new
         if not existing:
             return PolicyDecision("promote", "no existing fact in this scope")
 
-        # Key match path
+        # Key match path - check if any existing facts have same normalized key
         key_matches = [
             f for f in existing
-            if f.metadata.get("fact_key") == cand.key
+            if keys_are_same_concept(f.metadata.get("fact_key", ""), cand.key)
         ]
 
         if key_matches:
-            same_value = next(
+            # Check if value is the same (merge) or different (supersede)
+            same_value_fact = next(
                 (f for f in key_matches
-                if self._values_equal(f.metadata.get("fact_value", ""), cand.value)),
+                 if self._values_equal(f.metadata.get("fact_value", ""), cand.value)),
                 None,
             )
-            if same_value and len(key_matches) == 1:
+            
+            if same_value_fact and len(key_matches) == 1:
+                # Exact match - reinforce existing
                 return PolicyDecision(
                     "merge",
                     f"same key '{cand.key}', same value → reinforce",
-                    target=same_value,
+                    target=same_value_fact,
                 )
-            # Different value or multiple survivors → supersede all
+            
+            # Different value OR multiple survivors → supersede ALL
             return PolicyDecision(
                 "supersede",
-                f"key '{cand.key}' changed to '{cand.value}' "
-                f"({len(key_matches)} existing)",
+                f"key '{cand.key}' value changed to '{cand.value}' "
+                f"(superseding {len(key_matches)} existing)",
                 target=key_matches[0],
-                all_targets=key_matches,
+                all_targets=key_matches,  # ✅ Mark ALL for supersession
             )
 
         # Content similarity fallback (no key match)
@@ -356,9 +397,10 @@ class PromotionEngine:
                 "supersede",
                 "near-duplicate content with different value",
                 target=nearest,
-                all_targets=existing,
+                all_targets=existing,  # ✅ Supersede all similar facts
             )
 
+        # Similar content but distinct fact
         return PolicyDecision("promote", "similar content but distinct fact")
 
     # ---------- Stage 6: Execute Decision ----------
@@ -375,21 +417,25 @@ class PromotionEngine:
         
         if decision.action == "discard":
             logger.debug(
-                f"[Policy] DISCARD ({decision.reason}): '{cand.content[:50]}'"
+                f"[Policy] DISCARD ({decision.reason}): '{cand.content[:50]}...'"
             )
             return
 
         if decision.action == "promote":
+            # ✅ FIX: Put ALL metadata in the metadata dict
             fact = self.semantic.add_fact(
                 content=cand.content,
                 scope_type=scope_type,
                 scope_id=scope_id,
                 confidence=cand.confidence,
-                category=cand.fact_type,
                 source_episode_id=ep.episode_id,
                 trigger="promotion",
                 status="current",
-                metadata={"fact_key": cand.key, "fact_value": cand.value}
+                metadata={
+                    "category": cand.fact_type,  # ✅ Category in metadata, not separate param
+                    "fact_key": cand.key,
+                    "fact_value": cand.value,
+                }
             )
             
             ep.promoted_to.append({
@@ -402,7 +448,8 @@ class PromotionEngine:
             })
             
             logger.info(
-                f"[Policy] PROMOTE [{scope_type}:{scope_id}] '{cand.content[:50]}'"
+                f"[Policy] PROMOTE [{scope_type}:{scope_id}] "
+                f"key='{cand.key}' → {fact.fact_id[:8]}: '{cand.content[:50]}...'"
             )
             return
 
@@ -411,7 +458,8 @@ class PromotionEngine:
             
             self.semantic.bump_confidence(
                 fact_id=old.fact_id,
-                extra_episode_id=ep.episode_id
+                extra_episode_id=ep.episode_id,
+                fact=old,
             )
             
             ep.promoted_to.append({
@@ -421,29 +469,32 @@ class PromotionEngine:
             })
             
             logger.info(
-                f"[Policy] MERGE into {old.fact_id}: '{cand.content[:50]}'"
+                f"[Policy] MERGE into {old.fact_id[:8]}: '{cand.content[:50]}...'"
             )
             return
 
         if decision.action == "supersede":
+            # ✅ FIX: Supersede ALL matching facts, not just the first one
             targets = decision.targets_to_supersede()
 
             if not targets:
-                logger.warning("[Policy] SUPERSEDE with no targets - promoting instead")
-                decision.action = "promote"
-                # fall through to promote block... 
-                # easier: just call add_fact directly here
+                logger.warning(
+                    "[Policy] SUPERSEDE with no targets - promoting instead"
+                )
+                # Fallback to promote
                 fact = self.semantic.add_fact(
                     content=cand.content,
                     scope_type=scope_type,
                     scope_id=scope_id,
                     confidence=cand.confidence,
-                    category=cand.fact_type,
                     source_episode_id=ep.episode_id,
                     trigger="promotion",
                     status="current",
-                    writing_agent_id=ep.agent_id,
-                    metadata={"fact_key": cand.key, "fact_value": cand.value},
+                    metadata={
+                        "category": cand.fact_type,
+                        "fact_key": cand.key,
+                        "fact_value": cand.value,
+                    },
                 )
                 ep.promoted_to.append({
                     "type": "semantic_new",
@@ -452,6 +503,7 @@ class PromotionEngine:
                 })
                 return
 
+            # Create the new fact (supersedes primary old fact)
             primary_old = targets[0]
             new_fact = self.semantic.supersede_fact(
                 old_fact=primary_old,
@@ -460,16 +512,19 @@ class PromotionEngine:
                 scope_id=scope_id,
                 source_episode_id=ep.episode_id,
                 trigger="user_correction",
-                extra_metadata={"fact_key": cand.key, "fact_value": cand.value},
+                extra_metadata={
+                    "fact_key": cand.key,
+                    "fact_value": cand.value,
+                },
             )
 
             logger.info(
                 f"[Policy] SUPERSEDE {primary_old.fact_id[:8]} → "
-                f"{new_fact.fact_id[:8]}: '{cand.content[:50]}'"
+                f"{new_fact.fact_id[:8]}: '{cand.content[:50]}...'"
             )
 
-            # Mark ALL remaining duplicates as superseded too
-            # This fixes your current state where two facts survived
+            # ✅ CRITICAL FIX: Mark ALL remaining duplicates as superseded
+            # This prevents zombie facts from surviving
             for old_fact in targets[1:]:
                 try:
                     self.semantic.mark_superseded(
@@ -482,10 +537,10 @@ class PromotionEngine:
                     )
                 except Exception as exc:
                     logger.error(
-                        f"[Policy] Duplicate cleanup failed "
-                        f"{old_fact.fact_id[:8]}: {exc}"
+                        f"[Policy] Failed to mark duplicate {old_fact.fact_id[:8]} "
+                        f"as superseded: {exc}"
                     )
-                    raise
+                    # Don't raise - partial cleanup is better than none
 
             ep.promoted_to.append({
                 "type": "semantic_superseded",
@@ -509,7 +564,7 @@ class PromotionEngine:
         if ep.user_id.lower() in t:
             return True
         
-        # Agent lessons must mention agent
+        # Agent lessons must mention agent or "assistant"
         if cand.fact_type == "lesson":
             if ep.agent_id.lower() in t or "assistant" in t:
                 return True

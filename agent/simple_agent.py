@@ -4,7 +4,7 @@ from typing import Any, Dict, List
 from loguru import logger
 import openai
 
-from memory.llm import llm_client, llm_model
+from memory.llm import llm_client, llm_model_fast, llm_no_thinking
 from memory.retrieval import MemoryRetriever
 
 
@@ -37,7 +37,8 @@ class SimpleAgent:
             "- Answer using the factual knowledge and official procedures provided.\n"
             "- If a candidate procedure is provided, warn the user it is pending approval.\n"
             "- Reference past user preferences or constraints when relevant.\n"
-            "- If you lack sufficient context, be transparent and ask for clarification."
+            "- If you lack sufficient context, be transparent and ask for clarification.\n"
+            "- Reply with the user-facing answer only. No analysis, steps, or thinking."
         )
 
         messages = [
@@ -55,9 +56,11 @@ class SimpleAgent:
         # )
         client = llm_client()
         resp = client.chat.completions.create(
-            model=llm_model(),
+            model=llm_model_fast(),
             messages=messages,
-            temperature=0.4
+            temperature=0.4,
+            max_tokens=600,
+            **llm_no_thinking(),
         )
         return resp.choices[0].message.content
 

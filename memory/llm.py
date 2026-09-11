@@ -28,3 +28,18 @@ def llm_model() -> str:
     #     return f"openai/{model}"
     # return model
     return os.getenv("LLM_MODEL", "qwen/qwen3.8-27b")
+
+
+def llm_model_fast() -> str:
+    """Chat, routing, and intent splits. Same Groq key, separate rate bucket."""
+    return os.getenv("LLM_MODEL_FAST", "qwen/qwen3.6-27b")
+
+
+def llm_no_thinking() -> dict:
+    """Qwen 3.6 thinks by default. Hide that so chat is the answer only."""
+    return {
+        "extra_body": {
+            "reasoning_effort": "none",
+            "reasoning_format": "hidden",
+        }
+    }

@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional
 from loguru import logger
 import openai
 
-from memory.llm import llm_client, llm_model
+from memory.llm import llm_client, llm_model_fast, llm_no_thinking
 from memory.semantic_memory import SemanticMemory
 from memory.procedural_memory import ProceduralMemory
 from memory.episodic_memory import EpisodicMemory, _agent_aliases
@@ -81,10 +81,12 @@ class IntentRouter:
             # )
             client = llm_client()
             res = client.chat.completions.create(
-                model=llm_model(),
+                model=llm_model_fast(),
                 messages=[{"role": "user", "content": prompt}],
                 response_format={"type": "json_object"},
-                temperature=0.0
+                temperature=0.0,
+                max_tokens=256,
+                **llm_no_thinking(),
             )
             data = json.loads(res.choices[0].message.content)
             if data.get("primary") not in _CHANNELS:

@@ -9,7 +9,7 @@ import openai
 from pydantic import BaseModel, Field
 
 from memory.event_capture import EventLogger, EventRecord
-from memory.llm import llm_client, llm_model
+from memory.llm import llm_client, llm_model, llm_model_fast, llm_no_thinking
 
 
 class EpisodeRecord(BaseModel):
@@ -191,12 +191,13 @@ class ConsolidationEngine:
     Return ONLY the label:"""
 
         try:
-            client = openai.OpenAI()
+            client = llm_client()
             resp = client.chat.completions.create(
-                model="gpt-4o-mini",
+                model=llm_model_fast(),
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.0,
-                max_tokens=10
+                max_tokens=16,
+                **llm_no_thinking(),
             )
             
             intent = resp.choices[0].message.content.strip().lower()

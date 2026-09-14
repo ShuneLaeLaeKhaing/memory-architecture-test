@@ -11,6 +11,7 @@ from memory.semantic_memory import SemanticMemory
 from memory.procedural_memory import ProceduralMemory
 from memory.episodic_memory import EpisodicMemory, _agent_aliases
 from memory.knowledge_base import KnowledgeBase
+from memory.provenance import MemoryMetadata, Provenance
 
 
 def semantic_recall_scopes(user_id: str, agent_id: str) -> List[str]:
@@ -224,3 +225,115 @@ class MemoryRetriever:
 
     def get_knowledge_base_items(self, agent_id: str):
         return self.knowledge_base.get_all_items(agent_id=agent_id)
+
+    def get_memory_provenance(self, memory_id: str) -> Dict[str, Any]:
+        """
+        Debug tool: Trace a memory back to its original conversations.
+        
+        Returns complete lineage including:
+        - Original events
+        - Episodes that created it
+        - Sessions and threads
+        - Why it was promoted
+        """
+        mem0 = getattr(self, "mem0", None) or self.semantic.mem0
+        memory = mem0.get(memory_id)
+
+        if not memory:
+            return {"error": f"Memory {memory_id} not found"}
+
+        metadata_dict = memory.get("metadata") or {}
+        provenance = _provenance_from_fact_metadata(metadata_dict)
+
+        episodes = []
+        for episode_id in provenance.source_episode_ids:
+            episode = self._get_episode(episode_id)
+            if episode:
+                episodes.append(episode)
+
+        events = []
+        event_logger = getattr(self, "event_logger", None)
+        for event_id in provenance.source_event_ids:
+            event = event_logger.get_event(event_id) if event_logger and hasattr(event_logger, "get_event") else None
+            if event:
+                events.append(event)
+
+        conversations = self._format_provenance_conversations(events)
+
+        return {
+            "memory_id": memory_id,
+            "memory_text": memory.get("memory", ""),
+            "metadata": metadata_dict,
+            "source_episodes": episodes,
+            "source_events": events,
+            "original_conversations": conversations,
+            "confidence_score": provenance.confidence_score,
+            "promotion_reason": provenance.promotion_reason,
+            "created_at": provenance.created_at,
+            "last_reinforced_at": provenance.last_reinforced_at,
+        }
+
+    def _format_provenance_conversations(self, events: List) -> List[Dict]:
+        """Format events into readable conversation format"""
+        conversations = []
+        
+        for event in events:
+            payload = getattr(event, "payload", None) or getattr(event, "data", {}) or {}
+            content = payload.get("content") or payload.get("message") or payload.get("response") or ""
+            if event.event_type == "user_message":
+                conversations.append({
+                    'role': 'user',
+                    'content': content,
+                    'timestamp': event.timestamp,
+                    'session_id': event.session_id,
+                    'thread_id': event.thread_id,
+                })
+            elif event.event_type == "agent_response":
+                conversations.append({
+                    'role': 'assistant',
+                    'content': content,
+                    'timestamp': event.timestamp,
+                    'session_id': event.session_id,
+                    'thread_id': event.thread_id,
+                })
+        
+        return sorted(conversations, key=lambda x: x['timestamp'])
+    
+    def _get_episode(self, episode_id: str) -> Optional[Dict]:
+        """
+        Retrieve episode from storage.
+        Implement based on your episode storage (markdown files or database).
+        """
+        from pathlib import Path
+        import json
+        
+        # Assuming episodes stored in data/episodes/
+        episode_file = Path(f"data/episodes/{episode_id}.json")
+        
+        if episode_file.exists():
+            with open(episode_file, 'r') as f:
+                return json.load(f)
+        
+        return None
+
+
+def _provenance_from_fact_metadata(metadata_dict: Dict[str, Any]) -> Provenance:
+    """Read lineage from add_fact metadata (nested provenance or flat ids)."""
+    raw = metadata_dict.get("provenance")
+    if isinstance(raw, dict) and raw:
+        return Provenance.from_dict(raw)
+
+    if all(key in metadata_dict for key in ("memory_id", "memory_type", "memory_scope", "status")):
+        try:
+            return MemoryMetadata.from_dict(metadata_dict).provenance
+        except Exception:
+            pass
+
+    return Provenance(
+        source_episode_ids=list(metadata_dict.get("source_episode_ids") or []),
+        source_event_ids=list(metadata_dict.get("source_event_ids") or []),
+        source_session_ids=list(metadata_dict.get("source_session_ids") or []),
+        source_thread_ids=list(metadata_dict.get("source_thread_ids") or []),
+        promotion_reason=str(metadata_dict.get("promotion_reason") or ""),
+        confidence_score=float(metadata_dict.get("confidence") or 1.0),
+    )

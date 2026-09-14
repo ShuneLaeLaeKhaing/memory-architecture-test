@@ -28,6 +28,7 @@ class EpisodeRecord(BaseModel):
     source_event_ids: List[str] = Field(default_factory=list)
     retention_score: float
     scope: str
+    thread_id: str = ""
     metadata: Dict[str, Any] = Field(default_factory=dict)
     promoted_to: List[Dict[str, Any]] = Field(default_factory=list)
 
@@ -213,76 +214,35 @@ class ConsolidationEngine:
 
     def _evaluate_retention(self, segment: Dict[str, Any]) -> tuple[float, bool]:
         """
-        Calculate retention score.
-        
-        New logic: Keep most multi-turn conversations by default.
-        Promotion engine will handle quality filtering.
+        Junk filter only. Default keep. Promotion decides if it is a durable fact.
         """
         events: List[EventRecord] = segment["events"]
-        score = 0.0
-        
-        # Combine all text
-        all_text = " ".join([
-            str(e.payload.get("content", "")).lower() 
-            for e in events 
-            if e.event_type in ["user_message", "agent_response"]
-        ])
-        
-        # --- Strong signals (always keep) ---
-        
-        # Explicit memory requests
-        memory_keywords = ["remember", "save", "note", "policy", "rule", "always", "never"]
-        if any(kw in all_text for kw in memory_keywords):
-            score += 2.0
-        
-        # User feedback
-        if any(e.event_type == "user_feedback" for e in events):
-            score += 2.0
-        
-        # Failures/errors (learn from mistakes)
-        if any(e.event_type == "error" for e in events):
-            score += 1.5
-        
-        # --- Correction signals (NEW - this fixes your issue) ---
-        
-        correction_phrases = [
-            "actually", "no i mean", "correction", "switched to",
-            "changed to", "now using", "instead of", "not anymore"
+        user_texts = [
+            str(e.payload.get("content", "")).strip()
+            for e in events
+            if e.event_type == "user_message"
         ]
-        if any(phrase in all_text for phrase in correction_phrases):
-            score += 1.5  # High value - corrections are important
-        
-        # --- Preference/identity signals ---
-        
-        preference_words = ["prefer", "like", "want", "need", "my manager", "my team"]
-        if any(word in all_text for word in preference_words):
-            score += 1.0
-        
-        # --- Complexity signals ---
-        
-        # Multi-turn conversation
-        if len(events) >= 4:
-            score += 0.5
-        
-        # Tool usage
-        if any(e.event_type == "tool_call" for e in events):
-            score += 0.5
-        
-        # --- Negative signals ---
-        
-        # Single turn (probably trivial)
-        if len(events) <= 2:
-            score -= 0.3
-        
-        # Very short messages
-        word_count = len(all_text.split())
-        if word_count < 10:
-            score -= 0.3
-        
-        final_score = max(0.0, score)
-        threshold = 0.5
-        
-        return final_score, final_score >= threshold
+        user_texts = [t for t in user_texts if t]
+        if not user_texts:
+            return 0.0, False
+
+        chatter = {
+            "ok", "okay", "k", "kk", "yes", "yep", "yup", "yeah",
+            "hi", "hey", "hello", "thanks", "thank you", "thx", "ty",
+            "bye", "ok.", "okay.",
+            "ဟုတ်", "ဟုတ်ကဲ့", "ဟုတ်ပါတယ်", "ဟို", "ဟေး",
+            "ကျေးဇူး", "ကျေးဇူးပါ", "ကျေးဇူးတင်ပါတယ်",
+        }
+
+        def _is_chatter(text: str) -> bool:
+            lowered = text.lower().strip().strip(".,!?၊။")
+            return lowered in chatter or len(lowered) < 4
+
+        if all(_is_chatter(text) for text in user_texts):
+            logger.debug("[ConsolidationEngine] Dropped empty/chatter segment")
+            return 0.0, False
+
+        return 1.0, True
 
     def _synthesize_episode(self, segment: Dict[str, Any], user_id: str) -> EpisodeRecord:
         """Invokes structured LLM extraction to generate an EpisodeRecord."""
@@ -337,9 +297,11 @@ class ConsolidationEngine:
             }
 
         stamp = datetime.utcnow().strftime("%Y%m%d%H%M%S%f")
+        thread_ids = list(dict.fromkeys(e.thread_id for e in events if e.thread_id))
         episode = EpisodeRecord(
             episode_id=f"ep_{stamp}",
             session_id=events[0].session_id,
+            thread_id=thread_ids[0] if thread_ids else "",
             user_id=user_id,
             agent_id=events[0].agent_id,
             timestamp=events[0].timestamp,

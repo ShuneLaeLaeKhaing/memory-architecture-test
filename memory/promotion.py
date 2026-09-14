@@ -13,6 +13,7 @@ from memory.semantic_memory import SemanticMemory, SemanticFact
 from memory.procedural_memory import ProceduralMemory
 from memory.episodic_memory import EpisodicMemory
 from memory.key_normalizer import normalize_key, keys_are_same_concept
+from memory.provenance import Provenance
 
 
 # ============================================================
@@ -68,6 +69,30 @@ class PolicyDecision:
         if self.target:
             return [self.target]
         return []
+
+
+def _lineage_from_episode(ep: EpisodeRecord, reason: str) -> dict:
+    """Event / session / thread ids plus a provenance blob for add_fact metadata."""
+    event_ids = list(ep.source_event_ids or [])
+    session_ids = [ep.session_id] if ep.session_id else []
+    thread_ids = [ep.thread_id] if ep.thread_id else []
+    provenance = Provenance(
+        source_episode_ids=[ep.episode_id],
+        source_event_ids=event_ids,
+        source_thread_ids=thread_ids,
+        source_session_ids=session_ids,
+        created_by=ep.user_id,
+        promotion_reason=reason,
+        supporting_evidence_count=1,
+        confidence_score=ep.retention_score,
+    )
+    return {
+        "source_event_ids": event_ids,
+        "source_session_ids": session_ids,
+        "source_thread_ids": thread_ids,
+        "promotion_reason": reason,
+        "provenance": provenance.to_dict(),
+    }
 
 
 # ============================================================
@@ -435,6 +460,7 @@ Return empty array if nothing qualifies."""
                     "category": cand.fact_type,  # ✅ Category in metadata, not separate param
                     "fact_key": cand.key,
                     "fact_value": cand.value,
+                    **_lineage_from_episode(ep, f"promote: {decision.reason}"),
                 }
             )
             
@@ -460,6 +486,9 @@ Return empty array if nothing qualifies."""
                 fact_id=old.fact_id,
                 extra_episode_id=ep.episode_id,
                 fact=old,
+                extra_event_ids=list(ep.source_event_ids or []),
+                extra_session_ids=[ep.session_id] if ep.session_id else None,
+                extra_thread_ids=[ep.thread_id] if ep.thread_id else None,
             )
             
             ep.promoted_to.append({
@@ -494,6 +523,7 @@ Return empty array if nothing qualifies."""
                         "category": cand.fact_type,
                         "fact_key": cand.key,
                         "fact_value": cand.value,
+                        **_lineage_from_episode(ep, f"supersede-fallback: {decision.reason}"),
                     },
                 )
                 ep.promoted_to.append({
@@ -515,6 +545,7 @@ Return empty array if nothing qualifies."""
                 extra_metadata={
                     "fact_key": cand.key,
                     "fact_value": cand.value,
+                    **_lineage_from_episode(ep, f"supersede: {decision.reason}"),
                 },
             )
 

@@ -71,6 +71,15 @@ class SemanticMemory:
         # ✅ FIX: Ensure category goes into metadata, not lost as separate param
         if category:
             meta["category"] = category
+
+        lineage_keys = (
+            "source_event_ids",
+            "source_session_ids",
+            "source_thread_ids",
+            "promotion_reason",
+            "provenance",
+        )
+        kept_lineage = {key: meta[key] for key in lineage_keys if key in meta}
         
         meta.update({
             "scope": scope_label,
@@ -85,6 +94,11 @@ class SemanticMemory:
             "superseded_by": None,
             "created_at": datetime.utcnow().isoformat(),
         })
+        meta.update(kept_lineage)
+        episode_ids = list(dict.fromkeys(
+            _as_list(meta.get("source_episode_ids")) + [source_episode_id]
+        ))
+        meta["source_episode_ids"] = episode_ids
 
         resp = self.mem0.add(
             messages=[{"role": "user", "content": content}],
@@ -105,7 +119,7 @@ class SemanticMemory:
             confidence=confidence,
             status=status,
             version=meta["version"],
-            source_episode_ids=[source_episode_id],
+            source_episode_ids=episode_ids,
             created_at=meta["created_at"],
             created_by=trigger,
             supersedes_id=supersedes_id,
@@ -367,6 +381,9 @@ class SemanticMemory:
         extra_episode_id: str,
         delta: float = 0.05,
         fact: Optional[SemanticFact] = None,
+        extra_event_ids: Optional[List[str]] = None,
+        extra_session_ids: Optional[List[str]] = None,
+        extra_thread_ids: Optional[List[str]] = None,
     ) -> None:
         """Merge action: reinforce an existing fact instead of duplicating."""
         target = next((f for f in self._recent if f.fact_id == fact_id), None)
@@ -381,20 +398,46 @@ class SemanticMemory:
 
         new_conf = min(1.0, target.confidence + delta)
         episodes = list(dict.fromkeys(target.source_episode_ids + [extra_episode_id]))
+        event_ids = list(dict.fromkeys(
+            _as_list(target.metadata.get("source_event_ids")) + list(extra_event_ids or [])
+        ))
+        session_ids = list(dict.fromkeys(
+            _as_list(target.metadata.get("source_session_ids")) + list(extra_session_ids or [])
+        ))
+        thread_ids = list(dict.fromkeys(
+            _as_list(target.metadata.get("source_thread_ids")) + list(extra_thread_ids or [])
+        ))
+        new_meta = {
+            **target.metadata,
+            "confidence": new_conf,
+            "source_episode_ids": episodes,
+            "source_event_ids": event_ids,
+            "source_session_ids": session_ids,
+            "source_thread_ids": thread_ids,
+        }
+        provenance = new_meta.get("provenance")
+        if isinstance(provenance, dict):
+            new_meta["provenance"] = {
+                **provenance,
+                "source_episode_ids": episodes,
+                "source_event_ids": event_ids,
+                "source_session_ids": session_ids,
+                "source_thread_ids": thread_ids,
+                "supporting_evidence_count": max(
+                    int(provenance.get("supporting_evidence_count") or 1),
+                    len(episodes),
+                ),
+                "last_reinforced_at": datetime.utcnow().isoformat(),
+            }
         self._update_and_verify(
             fact_id=fact_id,
             text=target.content,
-            metadata={
-                **target.metadata,
-                "confidence": new_conf,
-                "source_episode_ids": episodes,
-            },
+            metadata=new_meta,
             expected_status=str(target.metadata.get("status") or "current"),
         )
         target.confidence = new_conf
         target.source_episode_ids = episodes
-        target.metadata["confidence"] = new_conf
-        target.metadata["source_episode_ids"] = episodes
+        target.metadata = new_meta
         if not any(f.fact_id == fact_id for f in self._recent):
             self._recent.append(target)
         logger.info(f"[SemanticMemory] Bumped confidence of {fact_id[:8]} → {new_conf:.2f}")

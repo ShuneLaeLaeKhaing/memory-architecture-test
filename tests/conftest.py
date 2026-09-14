@@ -3,6 +3,7 @@
 import shutil
 import sys
 import tempfile
+import uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -31,7 +32,7 @@ def temp_data_dir():
     """Create temporary data directory for tests."""
     temp_dir = tempfile.mkdtemp()
     yield temp_dir
-    shutil.rmtree(temp_dir)
+    shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 @pytest.fixture
@@ -136,6 +137,16 @@ def test_user():
     return {
         "user_id": "test_alice",
         "agent_id": "hr_assistant",
+    }
+
+
+@pytest.fixture
+def iso_users():
+    """Fresh user ids so leftover alice/bob Mem0 data cannot leak into isolation tests."""
+    tag = uuid.uuid4().hex[:8]
+    return {
+        "a": f"iso_a_{tag}",
+        "b": f"iso_b_{tag}",
     }
 
 

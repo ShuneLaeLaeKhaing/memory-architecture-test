@@ -53,6 +53,19 @@ class EventLogger:
         logger.debug(f"[EventLogger] Persisted {record.event_type} ({record.event_id})")
         return record
 
+    def get_event(self, event_id: str) -> Optional[EventRecord]:
+        """Find one event by id across session logs."""
+        for path in self.base_path.glob("*.jsonl"):
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    stripped = line.strip()
+                    if not stripped:
+                        continue
+                    event = EventRecord.model_validate_json(stripped)
+                    if event.event_id == event_id:
+                        return event
+        return None
+
     def get_events_for_thread(
         self,
         thread_id: str,

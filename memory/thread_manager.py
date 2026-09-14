@@ -61,11 +61,8 @@ class ThreadManager:
         path = self.base_path / f"{thread_id}.json"
         if not path.exists():
             return None
-        
-        with open(path, "r") as f:
-            data = json.load(f)
-        return Thread(**data)
-    
+        return self._load_thread_file(path)
+
     def list_threads(
         self,
         user_id: str,
@@ -74,13 +71,12 @@ class ThreadManager:
     ) -> List[Thread]:
         """List all threads for user (for sidebar)."""
         threads = []
-        
+
         for path in self.base_path.glob("*.json"):
-            with open(path, "r") as f:
-                data = json.load(f)
-            
-            thread = Thread(**data)
-            
+            thread = self._load_thread_file(path)
+            if thread is None:
+                continue
+
             # Filter
             if thread.user_id != user_id:
                 continue
@@ -88,12 +84,24 @@ class ThreadManager:
                 continue
             if thread.status != status:
                 continue
-            
+
             threads.append(thread)
-        
+
         # Sort by last_activity (newest first)
         threads.sort(key=lambda t: t.last_activity, reverse=True)
         return threads
+
+    def _load_thread_file(self, path: Path) -> Optional[Thread]:
+        """Skip empty or corrupt thread files from a failed save."""
+        try:
+            raw = path.read_text(encoding="utf-8").strip()
+            if not raw:
+                logger.warning(f"[ThreadManager] Skipping empty thread file: {path.name}")
+                return None
+            return Thread(**json.loads(raw))
+        except (json.JSONDecodeError, OSError, ValueError) as exc:
+            logger.warning(f"[ThreadManager] Skipping bad thread file {path.name}: {exc}")
+            return None
     
     def update_thread(self, thread: Thread) -> None:
         """Save updated thread."""
@@ -118,7 +126,7 @@ class ThreadManager:
     def _save_thread(self, thread: Thread) -> None:
         """Write thread to disk."""
         path = self.base_path / f"{thread.thread_id}.json"
-        with open(path, "w") as f:
+        with open(path, "w", encoding="utf-8") as f:
             f.write(thread.model_dump_json(indent=2))
     
     def _generate_title(self, message: str) -> str:

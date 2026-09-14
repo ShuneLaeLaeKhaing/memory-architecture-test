@@ -347,8 +347,8 @@ class TerminalApp:
         else:
             console.print(
                 "[yellow]No episodes kept.[/yellow] "
-                "Ordinary Q&A is discarded. Keep needs remember/save/note/policy, "
-                "a failure, or user feedback (retention ≥ 0.5)."
+                "Only empty or tiny chatter was dropped. "
+                "Promotion still decides what becomes a fact."
             )
 
     def _render_memory_inspection(self):

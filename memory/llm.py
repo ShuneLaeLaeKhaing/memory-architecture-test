@@ -32,11 +32,14 @@ def llm_model() -> str:
 
 def llm_model_fast() -> str:
     """Chat, routing, and intent splits. Same Groq key, separate rate bucket."""
-    return os.getenv("LLM_MODEL_FAST", "qwen/qwen3.6-27b")
+    return os.getenv("LLM_MODEL_FAST", "openai/gpt-oss-20b")
 
 
-def llm_no_thinking() -> dict:
-    """Qwen 3.6 thinks by default. Hide that so chat is the answer only."""
+def llm_no_thinking(model: str | None = None) -> dict:
+    """Hide extra reasoning. GPT-OSS only allows low|medium|high. Qwen allows none."""
+    name = (model or llm_model_fast()).lower()
+    if "gpt-oss" in name:
+        return {"extra_body": {"reasoning_effort": "low"}}
     return {
         "extra_body": {
             "reasoning_effort": "none",

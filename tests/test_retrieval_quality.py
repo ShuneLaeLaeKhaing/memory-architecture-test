@@ -2,11 +2,14 @@
 
 from datetime import datetime, timezone
 from pathlib import Path
+import uuid
 
 import pytest
 
+from agent.simple_agent import SimpleAgent
 from memory.consolidation import EpisodeRecord
-from memory.retrieval import _rule_route
+from memory.retrieval import _rule_route, apply_semantic_authority, scope_kind
+from memory.semantic_memory import SemanticFact
 
 
 AGENT_ID = "hr_assistant"
@@ -42,11 +45,40 @@ def _add_user_fact(semantic, user_id, content, key, value, episode_id):
     )
 
 
+def _add_org_fact(semantic, content, key, value, episode_id):
+    return semantic.add_fact(
+        content=content,
+        confidence=0.95,
+        source_episode_id=episode_id,
+        trigger="test",
+        status="current",
+        scope_type="organization",
+        scope_id="organization",
+        metadata={
+            "category": "policy",
+            "fact_key": key,
+            "fact_value": value,
+        },
+    )
+
+
 def _delete_user(semantic, user_id):
     try:
         semantic.mem0.delete_all(user_id=user_id)
     except Exception:
         pass
+
+
+def _delete_fact(semantic, fact):
+    if fact is None:
+        return
+    try:
+        semantic.mem0.delete(fact.fact_id)
+    except Exception:
+        pass
+    semantic._recent = [
+        item for item in semantic._recent if item.fact_id != fact.fact_id
+    ]
 
 
 def _index_episode(episodic, episode):
@@ -266,3 +298,172 @@ class TestRetrievalQuality:
             agent_id=AGENT_ID,
         )
         assert marker.lower() not in _blob(context)
+
+    def test_user_notify_pref_beats_org_same_key(
+        self, quality_retriever, semantic_memory, users
+    ):
+        user_a = users["a"]
+        mark = uuid.uuid4().hex[:10]
+        slack = f"slackchan{mark}"
+        email = f"emailchan{mark}"
+        org_fact = None
+        _add_user_fact(
+            semantic_memory,
+            user_a,
+            f"User prefers {slack} notifications",
+            "notify_channel",
+            slack,
+            "ep_auth_user_notify",
+        )
+        try:
+            org_fact = _add_org_fact(
+                semantic_memory,
+                f"Organization HR updates go by {email}",
+                "notify_channel",
+                email,
+                "ep_auth_org_notify",
+            )
+            context = quality_retriever.retrieve(
+                query="How should you notify me?",
+                user_id=user_a,
+                agent_id=AGENT_ID,
+            )
+            blob = _blob(context)
+            assert slack.lower() in blob
+            assert email.lower() not in blob
+        finally:
+            _delete_fact(semantic_memory, org_fact)
+
+    def test_unrelated_org_policy_not_returned(
+        self, quality_retriever, semantic_memory, users
+    ):
+        user_a = users["a"]
+        mark = uuid.uuid4().hex[:10]
+        theme = f"coraltheme{mark}"
+        notice = f"noticedays{mark}"
+        org_fact = None
+        _add_user_fact(
+            semantic_memory,
+            user_a,
+            f"User UI theme preference is {theme}",
+            "ui_theme",
+            theme,
+            "ep_auth_theme",
+        )
+        try:
+            org_fact = _add_org_fact(
+                semantic_memory,
+                f"Employees must give {notice} leave notice",
+                "leave_notice",
+                notice,
+                "ep_auth_leave",
+            )
+            context = quality_retriever.retrieve(
+                query="UI theme preference and leave notice",
+                user_id=user_a,
+                agent_id=AGENT_ID,
+            )
+            facts = context.get("semantic") or []
+            blob = _blob(context)
+            assert theme.lower() in blob
+            assert notice.lower() not in blob
+            assert "shared:organization" not in [
+                getattr(fact, "scope", "") for fact in facts
+            ]
+        finally:
+            _delete_fact(semantic_memory, org_fact)
+
+
+def _authority_fact(fact_id, content, scope, key="", score=0.5, user_id="alice"):
+    return SemanticFact(
+        fact_id=fact_id,
+        content=content,
+        user_id=user_id,
+        scope=scope,
+        confidence=0.9,
+        metadata={"fact_key": key, "_score": score},
+    )
+
+
+class TestSemanticAuthority:
+    """In-memory authority rules. No Mem0."""
+
+    def test_user_same_key_beats_higher_scoring_org(self):
+        user = _authority_fact(
+            "u1", "Notify this user via Slack", f"user:alice", "notify_channel", 0.4
+        )
+        org = _authority_fact(
+            "o1",
+            "HR updates go by email",
+            "shared:organization",
+            "notify_channel",
+            0.99,
+        )
+        ranked = apply_semantic_authority([org, user], user_id="alice")
+        assert [fact.fact_id for fact in ranked] == ["u1"]
+
+    def test_different_keys_keep_both_user_first(self):
+        user = _authority_fact(
+            "u1", "UI theme is dark", f"user:alice", "ui_theme", 0.3
+        )
+        org = _authority_fact(
+            "o1",
+            "Employees must give 14 days leave notice",
+            "shared:organization",
+            "leave_notice",
+            0.99,
+        )
+        ranked = apply_semantic_authority([org, user], user_id="alice")
+        assert [fact.fact_id for fact in ranked] == ["u1", "o1"]
+
+    def test_org_fact_naming_this_user_is_dropped(self):
+        user = _authority_fact(
+            "u1", "Notify this user via Slack", f"user:alice", "notify_channel", 0.5
+        )
+        org = _authority_fact(
+            "o1",
+            "alice organization sends HR updates by email",
+            "shared:organization",
+            "hr_channel",
+            0.95,
+        )
+        ranked = apply_semantic_authority([org, user], user_id="alice")
+        blob = " ".join(fact.content for fact in ranked).lower()
+        assert "slack" in blob
+        assert "email" not in blob
+
+    def test_prompt_puts_user_before_agent_and_states_override(self):
+        agent = SimpleAgent(
+            agent_config={"agent_id": AGENT_ID, "role": "HR assistant"},
+            retriever=object(),
+        )
+        prompt = agent._build_context_prompt({
+            "semantic": [
+                _authority_fact(
+                    "a1",
+                    "PTO formula is months x 1.5 minus used",
+                    "agent:hr_assistant",
+                    "pto_formula",
+                    0.99,
+                ),
+                _authority_fact(
+                    "u1",
+                    "Notify this user via Slack",
+                    "user:alice",
+                    "notify_channel",
+                    0.2,
+                ),
+            ]
+        })
+        assert "User-specific" in prompt
+        assert "Agent-learned" in prompt
+        assert prompt.index("User-specific") < prompt.index("Agent-learned")
+        assert prompt.index("Slack") < prompt.index("PTO formula")
+        assert "override" in prompt.lower()
+        guidelines = agent._system_prompt()
+        assert "user-specific memory conflicts" in guidelines.lower()
+
+    def test_scope_kind(self):
+        assert scope_kind("user:alice") == "user"
+        assert scope_kind("agent:hr_assistant") == "agent"
+        assert scope_kind("shared:organization") == "shared"

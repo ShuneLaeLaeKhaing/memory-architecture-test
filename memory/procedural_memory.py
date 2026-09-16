@@ -6,8 +6,7 @@ from typing import Any, Dict, List, Optional
 import chromadb
 from loguru import logger
 from pydantic import BaseModel, Field
-from sentence_transformers import SentenceTransformer
-
+from memory.embeddings import collection_name, get_encoder
 from memory.vector_util import has_hits, hit_similarity, query_collection
 
 
@@ -41,12 +40,13 @@ class ProceduralMemory:
     ):
         self.base_path = Path(base_path)
         self.base_path.mkdir(parents=True, exist_ok=True)
-        self.encoder = SentenceTransformer("all-MiniLM-L6-v2")
+        self.encoder = get_encoder()
         self.chroma_client = chromadb.PersistentClient(path=persist_dir)
         self.collection = self.chroma_client.get_or_create_collection(
-            name="procedural_skills",
+            name=collection_name("procedural_skills"),
             metadata={"hnsw:space": "cosine"}
         )
+        self._reindex_if_empty()
         logger.info("[ProceduralMemory] Initialized disk store and Chroma collection")
 
     def add_skill(
@@ -249,3 +249,32 @@ class ProceduralMemory:
                 if sk.scope in scopes:
                     skills.append(sk)
         return sorted(skills, key=lambda s: s.created_at, reverse=True)
+
+    def _reindex_if_empty(self) -> None:
+        if self.collection.count() > 0:
+            return
+        n = 0
+        for meta_file in self.base_path.glob("*.meta.json"):
+            skill = ProceduralSkill.model_validate_json(
+                meta_file.read_text(encoding="utf-8")
+            )
+            content = self.get_skill_content(skill.skill_id)
+            indexed_text = (
+                f"Title: {skill.title}\nDescription: {skill.description}\n\n{content}"
+            )
+            vector = self.encoder.encode(indexed_text).tolist()
+            self.collection.upsert(
+                ids=[skill.skill_id],
+                embeddings=[vector],
+                metadatas=[{
+                    "skill_id": skill.skill_id,
+                    "title": skill.title,
+                    "scope": skill.scope,
+                    "status": skill.status,
+                    "version": skill.version,
+                }],
+                documents=[indexed_text],
+            )
+            n += 1
+        if n:
+            logger.info(f"[ProceduralMemory] Reindexed {n} skills for {self.collection.name}")

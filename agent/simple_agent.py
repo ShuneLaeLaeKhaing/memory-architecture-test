@@ -6,7 +6,7 @@ import openai
 
 from memory.event_capture import EventLogger
 from memory.llm import llm_client, llm_model_fast, llm_no_thinking
-from memory.retrieval import MemoryRetriever
+from memory.retrieval import MemoryRetriever, scope_kind
 
 
 class SimpleAgent:
@@ -31,12 +31,6 @@ class SimpleAgent:
     ) -> str:
         """Retrieves targeted memory and conversation history."""
         
-        scopes = [
-            f"user:{user_id}",
-            f"agent:{self.config['agent_id']}",
-            "shared:organization"
-        ]
-
         # Long-term memory (facts, procedures)
         context = self.retriever.retrieve(
             query=user_message,
@@ -46,16 +40,7 @@ class SimpleAgent:
         )
 
         formatted_context = self._build_context_prompt(context)
-        
-        system_prompt = (
-            f"{self.config['role']}\n\n"
-            "Operational Guidelines:\n"
-            "- Answer using the factual knowledge and official procedures provided.\n"
-            "- If a candidate procedure is provided, warn the user it is pending approval.\n"
-            "- Reference past user preferences or constraints when relevant.\n"
-            "- If you lack sufficient context, be transparent and ask for clarification.\n"
-            "- Reply with the user-facing answer only. No analysis, steps, or thinking."
-        )
+        system_prompt = self._system_prompt()
         
         # Build messages
         messages = [
@@ -86,7 +71,7 @@ class SimpleAgent:
             messages=messages,
             temperature=0.4,
             max_tokens=600,
-            **llm_no_thinking(),
+            **llm_no_thinking(llm_model_fast()),
         )
         
         return resp.choices[0].message.content
@@ -129,6 +114,20 @@ class SimpleAgent:
         
         return messages
 
+    def _system_prompt(self) -> str:
+        return (
+            f"{self.config['role']}\n\n"
+            "Operational Guidelines:\n"
+            "- Answer using the factual knowledge and official procedures provided.\n"
+            "- If a candidate procedure is provided, warn the user it is pending approval.\n"
+            "- Reference past user preferences or constraints when relevant.\n"
+            "- When user-specific memory conflicts with agent or handbook "
+            "memory, follow the user-specific memory for this person's "
+            "preferences and how to reach them.\n"
+            "- If you lack sufficient context, be transparent and ask for clarification.\n"
+            "- Reply with the user-facing answer only. No analysis, steps, or thinking."
+        )
+
     def _build_context_prompt(self, context: Dict[str, Any]) -> str:
         """Formats retrieved items into organized Markdown sections for the LLM prompt."""
         sections: List[str] = []
@@ -148,12 +147,28 @@ class SimpleAgent:
             for doc in kb:
                 sections.append(f"#### {doc['title']}\n{doc['content']}\n")
 
-        # 3. Semantic Facts
+        # 3. Semantic Facts (user first; user overrides agent for personal prefs)
         facts = context.get("semantic", [])
         if facts:
             sections.append("### Authoritative Facts & Constraints")
-            for f in facts:
-                sections.append(f"- {f.content}")
+            sections.append(
+                "User-specific facts override agent facts "
+                "for this person's preferences and how to contact them."
+            )
+            buckets = {"user": [], "agent": [], "shared": []}
+            for fact in facts:
+                buckets[scope_kind(getattr(fact, "scope", "") or "")].append(fact)
+            for heading, kind in (
+                ("User-specific", "user"),
+                ("Agent-learned", "agent"),
+                ("Organization default", "shared"),
+            ):
+                items = buckets[kind]
+                if not items:
+                    continue
+                sections.append(f"#### {heading}")
+                for fact in items:
+                    sections.append(f"- {fact.content}")
 
         # 4. Episodic Past Experiences
         episodes = context.get("episodic", [])

@@ -14,6 +14,7 @@ from memory.procedural_memory import ProceduralMemory
 from memory.episodic_memory import EpisodicMemory
 from memory.key_normalizer import normalize_key, keys_are_same_concept
 from memory.provenance import Provenance
+from memory.sensitivity import sensitivity_metadata
 
 
 # ============================================================
@@ -36,6 +37,12 @@ TRANSIENT_PATTERNS = [
     "is currently", "just started", "recently", "was asked",
     "inquired about", "is learning", "is trying", "is setting up",
 ]
+
+_PERSONAL_POLICY_MARKERS = (
+    "to me", "with me", "for me", "when talking to me",
+    "from now on", "i prefer", "i want", "my manager",
+    "talking to me", "notify me",
+)
 
 
 # ============================================================
@@ -184,10 +191,15 @@ REJECT (do not extract):
 - "Technical setups may require..." (vague)
 - "New hires should familiarize..." (obvious)
 
+REJECT also:
+- Company handbook the assistant recited (leave notice, Workday access, SSO, IT routing)
+- How-to steps. Those belong in KB / procedural, not user facts
+- Do not rewrite a company rule as "for {ep.user_id}" to make it look personal
+
 ACCEPT examples:
 - "{ep.user_id} prefers MacBook for development" → key: preferred_laptop, value: MacBook
 - "{ep.user_id}'s manager is Sarah Chen" → key: manager_name, value: Sarah Chen
-- "IT department uses Microsoft Teams" → key: it_communication_tool, value: Microsoft Teams
+- "Reply in English from now on when talking to {ep.user_id}" → key: reply_language, value: English
 
 OUTPUT JSON:
 {{
@@ -197,7 +209,7 @@ OUTPUT JSON:
       "fact_type": "preference|identity|constraint|lesson|policy",
       "key": "snake_case_key",
       "value": "the essential value",
-      "scope_hint": "user|agent|organization",
+      "scope_hint": "user|agent",
       "confidence": 0.85-1.0,
       "evidence": "quote from episode"
     }}
@@ -248,15 +260,18 @@ Return empty array if nothing qualifies."""
     # ---------- Stage 3: Identity Resolution ----------
 
     def identity_for(self, cand: Candidate, ep: EpisodeRecord) -> Tuple[str, str]:
-        """Determine who owns this fact (user/agent/organization)."""
-        
+        """Semantic facts are user OR agent. Chat never writes shared:organization.
+
+        Company handbook stays in the knowledge base / approved procedures.
+        """
         if cand.fact_type == "lesson":
             return "agent", ep.agent_id
-        
-        if cand.fact_type == "policy":
-            return "organization", "organization"
-        
         return "user", ep.user_id
+
+    def _is_personal_policy(self, cand: Candidate) -> bool:
+        """User asked to remember a rule about themselves, not a handbook line."""
+        text = f"{cand.content} {cand.value}".lower()
+        return any(marker in text for marker in _PERSONAL_POLICY_MARKERS)
 
     # ---------- Stage 4: Existing Fact Lookup ----------
 
@@ -375,8 +390,16 @@ Return empty array if nothing qualifies."""
             return PolicyDecision("discard", "missing key or value")
         if self._matches_any(cand.content, GENERIC_PATTERNS):
             return PolicyDecision("discard", "generic advice pattern detected")
-        if self._matches_any(cand.content, TRANSIENT_PATTERNS):
+        if self._matches_any(
+            f"{cand.content} {ep.summary} {ep.goal}",
+            TRANSIENT_PATTERNS,
+        ):
             return PolicyDecision("discard", "transient statement (not durable)")
+        if cand.fact_type in ("policy", "constraint") and not self._is_personal_policy(cand):
+            return PolicyDecision(
+                "discard",
+                "company/handbook policy belongs in KB, not Mem0 shared or user memory",
+            )
         if not self._is_specific_enough(cand, ep):
             return PolicyDecision("discard", "not specific to user/agent/organization")
 
@@ -447,7 +470,6 @@ Return empty array if nothing qualifies."""
             return
 
         if decision.action == "promote":
-            # ✅ FIX: Put ALL metadata in the metadata dict
             fact = self.semantic.add_fact(
                 content=cand.content,
                 scope_type=scope_type,
@@ -456,12 +478,9 @@ Return empty array if nothing qualifies."""
                 source_episode_id=ep.episode_id,
                 trigger="promotion",
                 status="current",
-                metadata={
-                    "category": cand.fact_type,  # ✅ Category in metadata, not separate param
-                    "fact_key": cand.key,
-                    "fact_value": cand.value,
-                    **_lineage_from_episode(ep, f"promote: {decision.reason}"),
-                }
+                metadata=self._semantic_write_metadata(
+                    cand, ep, scope_type, f"promote: {decision.reason}"
+                ),
             )
             
             ep.promoted_to.append({
@@ -519,12 +538,12 @@ Return empty array if nothing qualifies."""
                     source_episode_id=ep.episode_id,
                     trigger="promotion",
                     status="current",
-                    metadata={
-                        "category": cand.fact_type,
-                        "fact_key": cand.key,
-                        "fact_value": cand.value,
-                        **_lineage_from_episode(ep, f"supersede-fallback: {decision.reason}"),
-                    },
+                    metadata=self._semantic_write_metadata(
+                        cand,
+                        ep,
+                        scope_type,
+                        f"supersede-fallback: {decision.reason}",
+                    ),
                 )
                 ep.promoted_to.append({
                     "type": "semantic_new",
@@ -542,11 +561,9 @@ Return empty array if nothing qualifies."""
                 scope_id=scope_id,
                 source_episode_id=ep.episode_id,
                 trigger="user_correction",
-                extra_metadata={
-                    "fact_key": cand.key,
-                    "fact_value": cand.value,
-                    **_lineage_from_episode(ep, f"supersede: {decision.reason}"),
-                },
+                extra_metadata=self._semantic_write_metadata(
+                    cand, ep, scope_type, f"supersede: {decision.reason}"
+                ),
             )
 
             logger.info(
@@ -582,6 +599,26 @@ Return empty array if nothing qualifies."""
 
     # ---------- Helper Methods ----------
 
+    def _semantic_write_metadata(
+        self,
+        cand: Candidate,
+        ep: EpisodeRecord,
+        scope_type: str,
+        reason: str,
+    ) -> dict:
+        """Key/value, lineage, and user-fact sensitivity for Mem0 writes."""
+        return {
+            "category": cand.fact_type,
+            "fact_key": cand.key,
+            "fact_value": cand.value,
+            **_lineage_from_episode(ep, reason),
+            **sensitivity_metadata(
+                cand.content,
+                scope_type=scope_type,
+                agent_id=ep.agent_id,
+            ),
+        }
+
     def _matches_any(self, text: str, patterns: List[str]) -> bool:
         """Check if text contains any pattern."""
         t = text.lower()
@@ -593,6 +630,8 @@ Return empty array if nothing qualifies."""
         
         # User-specific facts must mention user
         if ep.user_id.lower() in t:
+            return True
+        if any(marker in t for marker in _PERSONAL_POLICY_MARKERS):
             return True
         
         # Agent lessons must mention agent or "assistant"

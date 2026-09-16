@@ -110,7 +110,7 @@ class TestAdversarialPolicyGates:
         assert scope_type == "user"
         assert scope_id == users["a"]
 
-    def test_policy_type_goes_to_organization(self, promotion_engine, users):
+    def test_company_policy_is_discarded_not_org(self, promotion_engine, users):
         ep = _episode(users["a"])
         cand = _cand(
             users["a"],
@@ -120,7 +120,49 @@ class TestAdversarialPolicyGates:
             content="Company policy requires 2 remote days",
         )
         scope_type, scope_id = promotion_engine.identity_for(cand, ep)
-        assert scope_type == "organization"
+        assert scope_type == "user"
+        assert scope_id == users["a"]
+        assert promotion_engine.apply_policy(cand, [], ep).action == "discard"
+
+    def test_personal_policy_stays_on_user(self, promotion_engine, users):
+        ep = _episode(users["a"])
+        english = _cand(
+            users["a"],
+            "reply_language",
+            "english",
+            fact_type="policy",
+            scope_hint="user",
+            content="Reply in English from now on",
+        )
+        metric = _cand(
+            users["a"],
+            "units",
+            "metric",
+            fact_type="policy",
+            content="Always use metric units when talking to me",
+        )
+        named = _cand(
+            users["a"],
+            "notify",
+            "email",
+            fact_type="policy",
+            content=f"{users['a']}'s organization distributes updates via email",
+        )
+        assert promotion_engine.identity_for(english, ep) == ("user", users["a"])
+        assert promotion_engine.identity_for(metric, ep) == ("user", users["a"])
+        assert promotion_engine.identity_for(named, ep) == ("user", users["a"])
+
+    def test_employee_rule_is_discarded_not_org(self, promotion_engine, users):
+        ep = _episode(users["a"])
+        cand = _cand(
+            users["a"],
+            "leave_notice",
+            "3 days",
+            fact_type="policy",
+            content="Employees must submit leave requests 3 days in advance",
+        )
+        assert promotion_engine.identity_for(cand, ep) == ("user", users["a"])
+        assert promotion_engine.apply_policy(cand, [], ep).action == "discard"
 
     def test_low_confidence_discarded(self, promotion_engine, users):
         ep = _episode(users["a"])
@@ -136,6 +178,53 @@ class TestAdversarialPolicyGates:
             content=f"{users['a']} is currently setting up Workday",
         )
         assert promotion_engine.apply_policy(cand, [], ep).action == "discard"
+
+    def test_correction_does_not_copy_kb_leave_rule_onto_user(
+        self, promotion_engine, users
+    ):
+        ep = _episode(users["a"], outcome="correction")
+        cand = _cand(
+            users["a"],
+            "leave_notice_requirement_long",
+            "14 days",
+            fact_type="policy",
+            content=(
+                "The company requires 14 days of advance notice for any "
+                "leave exceeding 5 consecutive working days."
+            ),
+        )
+        assert promotion_engine.apply_policy(cand, [], ep).action == "discard"
+
+    def test_workday_how_to_prefixed_with_user_is_discarded(
+        self, promotion_engine, users
+    ):
+        ep = _episode(
+            users["a"],
+            summary=f"{users['a']} is currently setting up Workday",
+        )
+        cand = _cand(
+            users["a"],
+            "workday_access_prerequisites",
+            "HR paperwork",
+            fact_type="policy",
+            content=(
+                f"Workday access for {users['a']} requires completion of "
+                "HR paperwork and issuance of IT SSO credentials."
+            ),
+        )
+        assert promotion_engine.apply_policy(cand, [], ep).action == "discard"
+
+    def test_personal_reply_rule_still_promotes(self, promotion_engine, users):
+        ep = _episode(users["a"])
+        cand = _cand(
+            users["a"],
+            "reply_language",
+            "burmese",
+            fact_type="policy",
+            content="Reply in Burmese from now on when talking to me",
+        )
+        assert promotion_engine.apply_policy(cand, [], ep).action == "promote"
+        assert promotion_engine.identity_for(cand, ep) == ("user", users["a"])
 
     def test_generic_advice_discarded(self, promotion_engine, users):
         ep = _episode(users["a"])

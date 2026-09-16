@@ -172,7 +172,7 @@ class SemanticMemory:
         threshold: float = 0.45,
         scope_type: Optional[str] = None,
         scope_id: Optional[str] = None,
-        include_org_facts: bool = True,
+        include_org_facts: bool = False,
     ) -> List[SemanticFact]:
         """Search each Mem0 owner (user / agent / app), then filter by scope metadata."""
         wanted = list(scopes or [])

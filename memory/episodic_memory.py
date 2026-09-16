@@ -6,9 +6,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 import chromadb
 from loguru import logger
-from sentence_transformers import SentenceTransformer
-
 from memory.consolidation import EpisodeRecord
+from memory.embeddings import collection_name, get_encoder
 from memory.vector_util import has_hits, hit_similarity, query_collection
 
 
@@ -39,12 +38,13 @@ class EpisodicMemory:
     ):
         self.base_path = Path(base_path)
         self.base_path.mkdir(parents=True, exist_ok=True)
-        self.encoder = SentenceTransformer("all-MiniLM-L6-v2")
+        self.encoder = get_encoder()
         self.chroma_client = chromadb.PersistentClient(path=persist_dir)
         self.collection = self.chroma_client.get_or_create_collection(
-            name="episodes_history",
+            name=collection_name("episodes_history"),
             metadata={"hnsw:space": "cosine"}
         )
+        self._reindex_if_empty()
         logger.info("[EpisodicMemory] Initialized episodic vector storage")
 
     def index_episode(self, episode: EpisodeRecord) -> None:
@@ -151,3 +151,16 @@ class EpisodicMemory:
                     continue
                 results.append(ep)
         return sorted(results, key=lambda e: e.timestamp, reverse=True)
+
+    def _reindex_if_empty(self) -> None:
+        if self.collection.count() > 0:
+            return
+        n = 0
+        for item in self.base_path.glob("*.json"):
+            episode = EpisodeRecord.model_validate_json(
+                item.read_text(encoding="utf-8")
+            )
+            self.index_episode(episode)
+            n += 1
+        if n:
+            logger.info(f"[EpisodicMemory] Reindexed {n} episodes for {self.collection.name}")

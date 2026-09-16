@@ -198,7 +198,7 @@ class ConsolidationEngine:
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.0,
                 max_tokens=16,
-                **llm_no_thinking(),
+                **llm_no_thinking(llm_model_fast()),
             )
             
             intent = resp.choices[0].message.content.strip().lower()

@@ -5,8 +5,7 @@ from pathlib import Path
 from typing import Any, Dict, List
 import chromadb
 from loguru import logger
-from sentence_transformers import SentenceTransformer
-
+from memory.embeddings import collection_name, get_encoder
 from memory.vector_util import has_hits, hit_similarity, query_collection
 
 
@@ -20,12 +19,13 @@ class KnowledgeBase:
     ):
         self.base_path = Path(base_path)
         self.base_path.mkdir(parents=True, exist_ok=True)
-        self.encoder = SentenceTransformer("all-MiniLM-L6-v2")
+        self.encoder = get_encoder()
         self.chroma_client = chromadb.PersistentClient(path=persist_dir)
         self.collection = self.chroma_client.get_or_create_collection(
-            name="knowledge_base_catalog",
+            name=collection_name("knowledge_base_catalog"),
             metadata={"hnsw:space": "cosine"}
         )
+        self._reindex_if_empty()
         logger.info("[KnowledgeBase] Initialized Knowledge Base repository")
 
     def add_document(
@@ -126,3 +126,29 @@ class KnowledgeBase:
                 if data.get("agent_id") == agent_id:
                     items.append(data)
         return items
+
+    def _reindex_if_empty(self) -> None:
+        if self.collection.count() > 0:
+            return
+        n = 0
+        for meta_file in self.base_path.glob("*.meta.json"):
+            data = json.loads(meta_file.read_text(encoding="utf-8"))
+            doc_id = data.get("doc_id")
+            if not doc_id:
+                continue
+            content = self.get_document_content(doc_id)
+            vector = self.encoder.encode(content).tolist()
+            self.collection.upsert(
+                ids=[doc_id],
+                embeddings=[vector],
+                metadatas=[{
+                    "doc_id": doc_id,
+                    "agent_id": data.get("agent_id", ""),
+                    "title": data.get("title", ""),
+                    "category": data.get("category", ""),
+                }],
+                documents=[content],
+            )
+            n += 1
+        if n:
+            logger.info(f"[KnowledgeBase] Reindexed {n} docs for {self.collection.name}")

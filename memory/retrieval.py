@@ -2,27 +2,100 @@
 
 import json
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 from loguru import logger
 import openai
 
+from memory.key_normalizer import normalize_key
 from memory.llm import llm_client, llm_model_fast, llm_no_thinking
 from memory.semantic_memory import SemanticMemory
 from memory.procedural_memory import ProceduralMemory
 from memory.episodic_memory import EpisodicMemory, _agent_aliases
 from memory.knowledge_base import KnowledgeBase
 from memory.provenance import MemoryMetadata, Provenance
+from memory.sensitivity import filter_user_facts_for_agent, user_fact_visible_to_agent
+
+
+_CHANNELS = ("procedural", "semantic", "episodic")
+_AUTHORITY_RANK = {"user": 0, "agent": 1, "shared": 2}
 
 
 def semantic_recall_scopes(user_id: str, agent_id: str) -> List[str]:
-    """Same scopes chat recall uses: this user, this agent, shared."""
-    scopes = [f"user:{user_id}", "shared:organization"]
+    """Semantic recall: this user OR this agent. Not shared:organization."""
+    scopes = [f"user:{user_id}"]
     for alias in _agent_aliases(agent_id):
         scopes.append(f"agent:{alias}")
     return scopes
 
-_CHANNELS = ("procedural", "semantic", "episodic")
 
+def scope_kind(scope: str) -> str:
+    """user | agent | shared from a scope label."""
+    raw = (scope or "").strip().lower()
+    if raw.startswith("user:"):
+        return "user"
+    if raw.startswith("agent:"):
+        return "agent"
+    return "shared"
+
+
+def apply_semantic_authority(facts: List[Any], user_id: Optional[str] = None) -> List[Any]:
+    """
+    Retrieve-time authority, not write-time supersede.
+
+    - Drop leftover org facts that name this user (shared leak).
+    - Same fact_key: keep highest authority (user > agent > org).
+    - Remaining facts: user first, then agent, then leftover org, then score.
+    """
+    survivors: List[Any] = []
+    seen_ids = set()
+    user_marker = (user_id or "").strip().lower()
+
+    for fact in facts:
+        fact_id = getattr(fact, "fact_id", None) or id(fact)
+        if fact_id in seen_ids:
+            continue
+        seen_ids.add(fact_id)
+
+        kind = scope_kind(getattr(fact, "scope", "") or "")
+        content = (getattr(fact, "content", "") or "").lower()
+        if kind == "shared" and user_marker and user_marker in content:
+            logger.debug(
+                f"[Authority] Dropped org leak naming user '{user_id}': "
+                f"{content[:60]}"
+            )
+            continue
+        survivors.append(fact)
+
+    best_by_key: Dict[str, Any] = {}
+    unmatched: List[Any] = []
+    for fact in survivors:
+        meta = getattr(fact, "metadata", None) or {}
+        key = normalize_key(str(meta.get("fact_key") or "").strip())
+        if not key:
+            unmatched.append(fact)
+            continue
+        previous = best_by_key.get(key)
+        if previous is None or _authority_better(fact, previous):
+            best_by_key[key] = fact
+
+    ranked = list(best_by_key.values()) + unmatched
+    ranked.sort(
+        key=lambda fact: (
+            _AUTHORITY_RANK[scope_kind(getattr(fact, "scope", "") or "")],
+            -float((getattr(fact, "metadata", None) or {}).get("_score", 0.0)),
+        )
+    )
+    return ranked
+
+
+def _authority_better(candidate: Any, incumbent: Any) -> bool:
+    cand_rank = _AUTHORITY_RANK[scope_kind(getattr(candidate, "scope", "") or "")]
+    inc_rank = _AUTHORITY_RANK[scope_kind(getattr(incumbent, "scope", "") or "")]
+    if cand_rank != inc_rank:
+        return cand_rank < inc_rank
+    cand_score = float((getattr(candidate, "metadata", None) or {}).get("_score", 0.0))
+    inc_score = float((getattr(incumbent, "metadata", None) or {}).get("_score", 0.0))
+    return cand_score > inc_score
 
 # def _openai_client() -> openai.OpenAI:
 #     key = os.getenv("OPENAI_API_KEY", "")
@@ -87,7 +160,7 @@ class IntentRouter:
                 response_format={"type": "json_object"},
                 temperature=0.0,
                 max_tokens=256,
-                **llm_no_thinking(),
+                **llm_no_thinking(llm_model_fast()),
             )
             data = json.loads(res.choices[0].message.content)
             if data.get("primary") not in _CHANNELS:
@@ -131,10 +204,9 @@ class MemoryRetriever:
         scopes: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """
-        Retrieves context from all scopes:
-        - User-specific facts
-        - Agent-learned patterns
-        - Organization-wide knowledge
+        Retrieves user semantic facts and this agent's semantic facts.
+        User facts tagged agent_only stay with the source agent.
+        Company handbook is knowledge_base / approved procedures, not Mem0 org.
         """
         routing = self.router.route(query)
         primary = routing.get("primary", "semantic")
@@ -143,41 +215,44 @@ class MemoryRetriever:
         logger.info(f"[MemoryRetriever] Retrieval allocations: {limits}")
 
         recall_scopes = semantic_recall_scopes(user_id, agent_id)
-        allowed = scopes or recall_scopes
-        user_shared = [s for s in recall_scopes if not s.startswith("agent:")]
-        agent_scopes = [s for s in recall_scopes if s.startswith("agent:")]
+        allowed = set(scopes or recall_scopes)
+        semantic_limit = limits["semantic"]
 
-        user_facts = self.semantic.search(
-            query=query,
-            user_id=user_id,
-            scopes=user_shared,
-            top_k=max(1, limits["semantic"] // 2),
+        user_facts = filter_user_facts_for_agent(
+            self._search_semantic(
+                query,
+                owner_user_id=user_id,
+                wanted=[f"user:{user_id}"],
+                allowed=allowed,
+                top_k=semantic_limit,
+            ),
+            agent_id,
         )
-        agent_facts = self.semantic.search(
-            query=query,
-            user_id=user_id,
-            scopes=agent_scopes,
-            top_k=max(1, limits["semantic"] // 4),
+        agent_facts = self._search_semantic(
+            query,
+            owner_user_id=user_id,
+            wanted=[s for s in recall_scopes if s.startswith("agent:")],
+            allowed=allowed,
+            top_k=max(1, semantic_limit // 2),
         )
 
-        seen_ids = set()
-        semantic_hits: List[Any] = []
-        for fact in user_facts + agent_facts:
-            if fact.fact_id in seen_ids:
-                continue
-            seen_ids.add(fact.fact_id)
-            semantic_hits.append(fact)
-        semantic_hits.sort(key=lambda fact: float(fact.metadata.get("_score", 0.0)), reverse=True)
+        semantic_hits = apply_semantic_authority(
+            user_facts + agent_facts,
+            user_id=user_id,
+        )[: semantic_limit]
+
+        # Curated SOP skills still live as shared:organization in this playground.
+        procedural_scopes = list(allowed | {"shared:organization"})
 
         return {
             "routing": routing,
             "limits": limits,
             "procedural": self.procedural.search(
                 query=query,
-                scopes=allowed,
+                scopes=procedural_scopes,
                 top_k=limits["procedural"],
             ),
-            "semantic": semantic_hits[: limits["semantic"]],
+            "semantic": semantic_hits,
             "episodic": self.episodic.search(
                 query=query,
                 user_id=user_id,
@@ -191,6 +266,25 @@ class MemoryRetriever:
             ),
         }
 
+    def _search_semantic(
+        self,
+        query: str,
+        *,
+        owner_user_id: Optional[str],
+        wanted: List[str],
+        allowed: Set[str],
+        top_k: int,
+    ) -> List[Any]:
+        scopes = [scope for scope in wanted if scope in allowed]
+        if not scopes:
+            return []
+        return self.semantic.search(
+            query=query,
+            user_id=owner_user_id,
+            scopes=scopes,
+            top_k=max(1, top_k),
+        )
+
     def _calculate_budgets(self, primary: str, secondaries: List[str]) -> Dict[str, int]:
         limits: Dict[str, int] = {}
         for channel in ["procedural", "semantic", "episodic"]:
@@ -203,10 +297,16 @@ class MemoryRetriever:
         return limits
 
     def get_semantic_facts(self, user_id: str, agent_id: str):
-        return self.semantic.get_all_facts(
+        facts = self.semantic.get_all_facts(
             user_id=user_id,
             scopes=semantic_recall_scopes(user_id, agent_id),
         )
+        return [
+            fact
+            for fact in facts
+            if scope_kind(getattr(fact, "scope", "") or "") != "user"
+            or user_fact_visible_to_agent(fact, agent_id)
+        ]
 
     def get_procedural_skills(self, scopes: List[str]):
         return self.procedural.get_all_skills(scopes=scopes)

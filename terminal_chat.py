@@ -355,14 +355,14 @@ class TerminalApp:
         console.print("\n")
         console.rule("[bold magenta]AUTHORITATIVE MEMORY STATE[/bold magenta]")
         
-        # Same scopes as chat recall: this user + this agent + shared
+        # Same scopes as chat recall: this user + this agent
         recall_facts = self.retriever.get_semantic_facts(
             user_id=self.current_user_id,
             agent_id=self.current_agent_id,
         )
 
         t_facts = Table(
-            title="Semantic Facts (eligible for recall: user + this agent + shared)",
+            title="Semantic Facts (eligible for recall: user + this agent)",
             header_style="bold cyan",
         )
         t_facts.add_column("Fact ID", style="dim", width=18)

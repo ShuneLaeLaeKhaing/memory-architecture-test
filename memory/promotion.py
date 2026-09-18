@@ -390,10 +390,9 @@ Return empty array if nothing qualifies."""
             return PolicyDecision("discard", "missing key or value")
         if self._matches_any(cand.content, GENERIC_PATTERNS):
             return PolicyDecision("discard", "generic advice pattern detected")
-        if self._matches_any(
-            f"{cand.content} {ep.summary} {ep.goal}",
-            TRANSIENT_PATTERNS,
-        ):
+        # Only scan the candidate text — episode summaries often say
+        # "inquired about" / "was asked" even when the fact itself is durable.
+        if self._matches_any(cand.content, TRANSIENT_PATTERNS):
             return PolicyDecision("discard", "transient statement (not durable)")
         if cand.fact_type in ("policy", "constraint") and not self._is_personal_policy(cand):
             return PolicyDecision(

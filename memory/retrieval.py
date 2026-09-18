@@ -2,7 +2,8 @@
 
 import json
 import os
-from typing import Any, Dict, List, Optional, Set
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Set, Tuple
 from loguru import logger
 import openai
 
@@ -18,6 +19,12 @@ from memory.sensitivity import filter_user_facts_for_agent, user_fact_visible_to
 
 _CHANNELS = ("procedural", "semantic", "episodic")
 _AUTHORITY_RANK = {"user": 0, "agent": 1, "shared": 2}
+
+# Conflict authority (recall-time):
+# 1. Old thread vs newer semantic  → semantic
+# 2. Current thread vs older semantic → thread
+# 3. Two semantic same key           → newer semantic (version / created_at)
+# 4. Two thread statements           → newer thread (chronological history)
 
 
 def semantic_recall_scopes(user_id: str, agent_id: str) -> List[str]:
@@ -38,13 +45,50 @@ def scope_kind(scope: str) -> str:
     return "shared"
 
 
+def parse_memory_timestamp(value: Any) -> Optional[datetime]:
+    """Parse ISO timestamps used on facts and events. Returns None if unknown."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=None) if value.tzinfo else value
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(text)
+        return dt.replace(tzinfo=None) if dt.tzinfo else dt
+    except ValueError:
+        return None
+
+
+def fact_timestamp(fact: Any) -> Optional[datetime]:
+    """Best-effort write time for a semantic fact."""
+    meta = getattr(fact, "metadata", None) or {}
+    for key in ("created_at", "updated_at", "timestamp"):
+        parsed = parse_memory_timestamp(meta.get(key))
+        if parsed is not None:
+            return parsed
+    return parse_memory_timestamp(getattr(fact, "created_at", None))
+
+
+def fact_version(fact: Any) -> int:
+    meta = getattr(fact, "metadata", None) or {}
+    raw = meta.get("version", getattr(fact, "version", 1))
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return 1
+
+
 def apply_semantic_authority(facts: List[Any], user_id: Optional[str] = None) -> List[Any]:
     """
     Retrieve-time authority, not write-time supersede.
 
     - Drop leftover org facts that name this user (shared leak).
-    - Same fact_key: keep highest authority (user > agent > org).
-    - Remaining facts: user first, then agent, then leftover org, then score.
+    - Same fact_key: user > agent > org; then newer version / created_at; then score.
+    - Remaining facts: user first, then agent, then leftover org, then recency, then score.
     """
     survivors: List[Any] = []
     seen_ids = set()
@@ -79,20 +123,40 @@ def apply_semantic_authority(facts: List[Any], user_id: Optional[str] = None) ->
             best_by_key[key] = fact
 
     ranked = list(best_by_key.values()) + unmatched
-    ranked.sort(
-        key=lambda fact: (
-            _AUTHORITY_RANK[scope_kind(getattr(fact, "scope", "") or "")],
-            -float((getattr(fact, "metadata", None) or {}).get("_score", 0.0)),
-        )
-    )
+    ranked.sort(key=_semantic_sort_key)
     return ranked
 
 
+def _recency_tuple(fact: Any) -> Tuple[int, float]:
+    """Higher is newer: (version, created_at epoch). Missing time sorts as old."""
+    ts = fact_timestamp(fact)
+    epoch = ts.timestamp() if ts is not None else 0.0
+    return (fact_version(fact), epoch)
+
+
+def _semantic_sort_key(fact: Any) -> Tuple:
+    version, epoch = _recency_tuple(fact)
+    score = float((getattr(fact, "metadata", None) or {}).get("_score", 0.0))
+    return (
+        _AUTHORITY_RANK[scope_kind(getattr(fact, "scope", "") or "")],
+        -version,
+        -epoch,
+        -score,
+    )
+
+
 def _authority_better(candidate: Any, incumbent: Any) -> bool:
+    """True if candidate should replace incumbent for the same fact_key."""
     cand_rank = _AUTHORITY_RANK[scope_kind(getattr(candidate, "scope", "") or "")]
     inc_rank = _AUTHORITY_RANK[scope_kind(getattr(incumbent, "scope", "") or "")]
     if cand_rank != inc_rank:
         return cand_rank < inc_rank
+
+    cand_recency = _recency_tuple(candidate)
+    inc_recency = _recency_tuple(incumbent)
+    if cand_recency != inc_recency:
+        return cand_recency > inc_recency
+
     cand_score = float((getattr(candidate, "metadata", None) or {}).get("_score", 0.0))
     inc_score = float((getattr(incumbent, "metadata", None) or {}).get("_score", 0.0))
     return cand_score > inc_score
@@ -118,6 +182,21 @@ def _authority_better(candidate: Any, incumbent: Any) -> bool:
 def _rule_route(query: str) -> Dict[str, Any]:
     """Same three channels as the router prompt."""
     low = query.lower()
+    # Preference / identity recall — not procedural (avoids starving semantic budget)
+    if any(
+        marker in low
+        for marker in (
+            "notify me",
+            "notification",
+            "prefer",
+            "preference",
+            "my salary",
+            "ui theme",
+            "dark mode",
+            "light mode",
+        )
+    ):
+        return {"primary": "semantic", "secondary": ["episodic", "procedural"], "confidence": 0.75}
     if any(marker in low for marker in ("how do i", "how to", "steps to", "procedure", "workflow")):
         return {"primary": "procedural", "secondary": ["semantic", "episodic"], "confidence": 0.7}
     if any(marker in low for marker in ("last time", "yesterday", "we discussed", "previous conversation", "remember when")):

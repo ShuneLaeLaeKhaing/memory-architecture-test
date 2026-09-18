@@ -1,6 +1,7 @@
 """Terminal Interactive Chat: Test harness for the unified memory architecture."""
 
 import sys
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -66,15 +67,19 @@ class TerminalApp:
             episodic=self.episodic_memory,
             knowledge_base=self.knowledge_base
         )
-        self.consolidation_scheduler = ConsolidationScheduler(
-            inactivity_timeout=300
-        )
 
         self.current_user_id = "alice"
         self.current_agent_id = "hr_assistant"
         self.session_id = ""
         self.agent: SimpleAgent = None
         self.current_thread: Optional[Thread] = None
+        self.session_event_count = 0
+        self._consolidate_lock = threading.Lock()
+
+        self.consolidation_scheduler = ConsolidationScheduler(
+            inactivity_timeout=300,
+            on_timeout=self._on_idle_timeout,
+        )
 
     def start(self):
         console.clear()
@@ -94,9 +99,23 @@ class TerminalApp:
         console.print("1. [bold]alice[/bold] (Engineering Lead)")
         console.print("2. [bold]bob[/bold] (Senior Operations Specialist)")
         console.print("3. [bold]carol[/bold] (New Hire Employee)")
+        console.print("4. [bold]dave[/bold] (Fresh tester A)")
+        console.print("5. [bold]eve[/bold] (Fresh tester B)")
+        console.print("6. [bold]frank[/bold] (Fresh tester C)")
 
-        choice = Prompt.ask("Choose user", choices=["1", "2", "3"], default="1")
-        user_map = {"1": "alice", "2": "bob", "3": "carol"}
+        choice = Prompt.ask(
+            "Choose user",
+            choices=["1", "2", "3", "4", "5", "6"],
+            default="4",
+        )
+        user_map = {
+            "1": "alice",
+            "2": "bob",
+            "3": "carol",
+            "4": "dave",
+            "5": "eve",
+            "6": "frank",
+        }
         self.current_user_id = user_map[choice]
 
         console.print("\n[bold cyan]Select Agent:[/bold cyan]")
@@ -165,6 +184,7 @@ class TerminalApp:
         from datetime import datetime
         
         self.session_id = f"sess_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
+        self.session_event_count = 0
         
         if self.current_thread:
             # Add session to existing thread
@@ -212,7 +232,13 @@ class TerminalApp:
         console.print("[dim]─── End of History ───[/dim]\n")
 
     def _loop(self):
-        console.print("[dim]Commands: /threads (switch), /new (new thread), /memory, /exit[/dim]\n")
+        threshold = self._event_count_threshold()
+        idle_s = self.consolidation_scheduler.inactivity_timeout
+        console.print(
+            "[dim]Commands: /threads, /new, /memory, /consolidate, /exit[/dim]\n"
+            f"[dim]Auto-consolidate: end phrases (bye/thanks), "
+            f"idle {idle_s}s, or every {threshold} events[/dim]\n"
+        )
         
         while True:
             try:
@@ -226,19 +252,17 @@ class TerminalApp:
                     cmd = user_msg.strip().lower()
                     
                     if cmd == "/exit":
-                        self._trigger_consolidation()
+                        self._trigger_consolidation(reason="exit")
                         console.print("[yellow]Goodbye![/yellow]")
                         break
                     
                     elif cmd == "/threads":
-                        # Switch threads (like clicking sidebar)
-                        self._trigger_consolidation()
+                        self._trigger_consolidation(reason="switch-thread")
                         self._show_thread_selection()
                         continue
                     
                     elif cmd == "/new":
-                        # Create new thread
-                        self._trigger_consolidation()
+                        self._trigger_consolidation(reason="new-thread")
                         self._create_new_thread()
                         continue
                     
@@ -247,7 +271,7 @@ class TerminalApp:
                         continue
                     
                     elif cmd == "/consolidate":
-                        self._trigger_consolidation()
+                        self._trigger_consolidation(reason="manual")
                         continue
                     
                     else:
@@ -262,7 +286,6 @@ class TerminalApp:
                         initial_message=user_msg
                     )
                     
-                    # Log session start now that we have thread_id
                     self.event_logger.log_event({
                         "event_type": "session_start",
                         "session_id": self.session_id,
@@ -281,20 +304,23 @@ class TerminalApp:
                     "agent_id": self.current_agent_id,
                     "payload": {"content": user_msg}
                 })
-                
-                # Update thread
+                self.session_event_count += 1
                 self.thread_manager.increment_message_count(self.current_thread.thread_id)
+
+                end_signal = self.consolidation_scheduler.on_message(
+                    self.session_id,
+                    user_msg,
+                    message_type="user",
+                )
                 
-                # Get response (with thread context!)
                 with console.status("[dim cyan]Thinking...[/dim cyan]"):
                     reply = self.agent.respond(
                         user_message=user_msg,
                         user_id=self.current_user_id,
                         session_id=self.session_id,
-                        thread_id=self.current_thread.thread_id if self.current_thread else None  # ✅ NEW
+                        thread_id=self.current_thread.thread_id if self.current_thread else None
                     )
                 
-                # Log agent response
                 self.event_logger.log_event({
                     "event_type": "agent_response",
                     "session_id": self.session_id,
@@ -303,18 +329,34 @@ class TerminalApp:
                     "agent_id": self.current_agent_id,
                     "payload": {"content": reply}
                 })
-                
-                # Update thread
+                self.session_event_count += 1
                 self.thread_manager.increment_message_count(self.current_thread.thread_id)
+
+                # Refresh idle timer after agent reply (not an end signal)
+                self.consolidation_scheduler.on_message(
+                    self.session_id,
+                    reply,
+                    message_type="agent",
+                )
                 
-                # Display
                 cfg = AGENT_CONFIGS[self.current_agent_id]
                 console.print(f"\n[bold green]{cfg['name']}:[/bold green]")
                 console.print(Markdown(reply))
                 console.print("")
+
+                threshold = self._event_count_threshold()
+                if end_signal:
+                    console.print("[dim yellow]End signal — consolidating...[/dim yellow]")
+                    self._trigger_consolidation(reason="end-signal")
+                elif self.session_event_count >= threshold:
+                    console.print(
+                        f"[dim yellow]Event count {self.session_event_count}/"
+                        f"{threshold} — consolidating...[/dim yellow]"
+                    )
+                    self._trigger_consolidation(reason="event-count")
                 
             except (KeyboardInterrupt, EOFError):
-                self._trigger_consolidation()
+                self._trigger_consolidation(reason="interrupt")
                 break
     
     def _format_age(self, timestamp_str: str) -> str:
@@ -333,20 +375,47 @@ class TerminalApp:
         else:
             return "just now"
 
-    def _trigger_consolidation(self):
-        with console.status("[dim yellow]Running consolidation & promotion...[/dim yellow]"):
-            episodes = self.consolidation_engine.consolidate_session(
-                session_id=self.session_id,
-                user_id=self.current_user_id
-            )
+    def _event_count_threshold(self) -> int:
+        cfg = AGENT_CONFIGS.get(self.current_agent_id) or {}
+        triggers = (cfg.get("memory_config") or {}).get("consolidation_triggers") or {}
+        return int(triggers.get("event_count_threshold") or 20)
+
+    def _on_idle_timeout(self, session_id: str) -> None:
+        """Called from scheduler timer thread after inactivity."""
+        if session_id != self.session_id:
+            return
+        console.print(
+            f"\n[yellow]Idle {self.consolidation_scheduler.inactivity_timeout}s "
+            f"— auto-consolidating...[/yellow]"
+        )
+        self._trigger_consolidation(reason="idle")
+        console.print(
+            f"[dim]Still here as {self.current_user_id}. Type to continue.[/dim]\n"
+        )
+
+    def _trigger_consolidation(self, reason: str = "manual"):
+        with self._consolidate_lock:
+            if self.session_id:
+                self.consolidation_scheduler.force_consolidate(self.session_id)
+            with console.status(
+                f"[dim yellow]Running consolidation & promotion ({reason})...[/dim yellow]"
+            ):
+                episodes = self.consolidation_engine.consolidate_session(
+                    session_id=self.session_id,
+                    user_id=self.current_user_id
+                )
+            self.session_event_count = 0
         if episodes:
-            console.print(f"[green]✓ Consolidated {len(episodes)} new episode(s)[/green]")
+            console.print(
+                f"[green]✓ Consolidated {len(episodes)} new episode(s) "
+                f"[{reason}][/green]"
+            )
             for ep in episodes:
                 if ep.promoted_to:
                     console.print(f"  [cyan]-> Promoted items:[/cyan] {ep.promoted_to}")
         else:
             console.print(
-                "[yellow]No episodes kept.[/yellow] "
+                f"[yellow]No episodes kept [{reason}].[/yellow] "
                 "Only empty or tiny chatter was dropped. "
                 "Promotion still decides what becomes a fact."
             )
@@ -440,7 +509,7 @@ if __name__ == "__main__":
     def shutdown_handler(signum, frame):
         console.print("\n[yellow]Shutting down gracefully...[/yellow]")
         app.consolidation_scheduler.cleanup()
-        app._trigger_consolidation()
+        app._trigger_consolidation(reason="shutdown")
         sys.exit(0)
     
     signal.signal(signal.SIGINT, shutdown_handler)

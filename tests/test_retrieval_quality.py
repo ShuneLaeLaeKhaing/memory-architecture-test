@@ -374,14 +374,28 @@ class TestRetrievalQuality:
             _delete_fact(semantic_memory, org_fact)
 
 
-def _authority_fact(fact_id, content, scope, key="", score=0.5, user_id="alice"):
+def _authority_fact(
+    fact_id,
+    content,
+    scope,
+    key="",
+    score=0.5,
+    user_id="alice",
+    version=1,
+    created_at=None,
+):
+    meta = {"fact_key": key, "_score": score, "version": version}
+    if created_at:
+        meta["created_at"] = created_at
     return SemanticFact(
         fact_id=fact_id,
         content=content,
         user_id=user_id,
         scope=scope,
         confidence=0.9,
-        metadata={"fact_key": key, "_score": score},
+        version=version,
+        created_at=created_at or "2026-01-01T00:00:00",
+        metadata=meta,
     )
 
 
@@ -401,6 +415,28 @@ class TestSemanticAuthority:
         )
         ranked = apply_semantic_authority([org, user], user_id="alice")
         assert [fact.fact_id for fact in ranked] == ["u1"]
+
+    def test_newer_same_key_beats_older_same_scope(self):
+        older = _authority_fact(
+            "old",
+            "Notify via Slack",
+            "user:alice",
+            "notify_channel",
+            score=0.99,
+            version=2,
+            created_at="2026-09-01T10:00:00",
+        )
+        newer = _authority_fact(
+            "new",
+            "Notify via Microsoft Teams",
+            "user:alice",
+            "notify_channel",
+            score=0.2,
+            version=5,
+            created_at="2026-09-17T10:00:00",
+        )
+        ranked = apply_semantic_authority([older, newer], user_id="alice")
+        assert [fact.fact_id for fact in ranked] == ["new"]
 
     def test_different_keys_keep_both_user_first(self):
         user = _authority_fact(
@@ -452,6 +488,7 @@ class TestSemanticAuthority:
                     "user:alice",
                     "notify_channel",
                     0.2,
+                    created_at="2026-09-17T10:04:00",
                 ),
             ]
         })
@@ -460,8 +497,10 @@ class TestSemanticAuthority:
         assert prompt.index("User-specific") < prompt.index("Agent-learned")
         assert prompt.index("Slack") < prompt.index("PTO formula")
         assert "override" in prompt.lower()
+        assert "as_of=" in prompt
         guidelines = agent._system_prompt()
         assert "user-specific memory conflicts" in guidelines.lower()
+        assert "resolved preference conflicts" in guidelines.lower()
 
     def test_scope_kind(self):
         assert scope_kind("user:alice") == "user"

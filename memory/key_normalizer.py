@@ -29,10 +29,22 @@ EXACT_SYNONYMS: dict[str, list[str]] = {
     "ui_theme": [
         "ui_theme",
         "ui_theme_preference",
+        "preferred_ui_theme",
         "interface_theme",
         "interface_theme_preference",
+        "preferred_interface_theme",
+        "user_interface_theme",
         "theme_preference",
         "display_theme",
+        "preferred_theme",
+        "default_theme",
+    ],
+    "notification_channel": [
+        "notification_channel",
+        "notification_channel_preference",
+        "preferred_notification_channel",
+        "notify_channel",
+        "notification_preference",
     ],
     "preferred_laptop": [
         "preferred_laptop",

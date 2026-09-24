@@ -7,9 +7,13 @@ from typing import List, Optional, Tuple
 
 from loguru import logger
 
+from memory.jev_client import choice as jev_choice
+from memory.jev_client import noul as jev_noul
 from memory.llm import llm_client, llm_model
 from memory.consolidation import EpisodeRecord
-from memory.semantic_memory import SemanticMemory, SemanticFact
+from memory.semantic_memory import SemanticFact
+from memory.semantic_factory import open_semantic_store
+from memory.semantic_store import SemanticStore
 from memory.procedural_memory import ProceduralMemory
 from memory.episodic_memory import EpisodicMemory
 from memory.key_normalizer import normalize_key, keys_are_same_concept
@@ -111,11 +115,11 @@ class PromotionEngine:
 
     def __init__(
         self,
-        semantic_memory: Optional[SemanticMemory] = None,
+        semantic_memory: Optional[SemanticStore] = None,
         procedural_memory: Optional[ProceduralMemory] = None,
         episodic_memory: Optional[EpisodicMemory] = None
     ):
-        self.semantic = semantic_memory or SemanticMemory()
+        self.semantic: SemanticStore = semantic_memory or open_semantic_store()
         self.procedural = procedural_memory or ProceduralMemory()
         self.episodic = episodic_memory or EpisodicMemory()
 
@@ -196,10 +200,12 @@ REJECT also:
 - How-to steps. Those belong in KB / procedural, not user facts
 - Do not rewrite a company rule as "for {ep.user_id}" to make it look personal
 
-ACCEPT examples:
+ACCEPT examples (prefer canonical keys ui_theme | notification_channel | preferred_laptop | manager_name):
 - "{ep.user_id} prefers MacBook for development" → key: preferred_laptop, value: MacBook
 - "{ep.user_id}'s manager is Sarah Chen" → key: manager_name, value: Sarah Chen
 - "Reply in English from now on when talking to {ep.user_id}" → key: reply_language, value: English
+- "{ep.user_id} prefers dark mode" → key: ui_theme, value: dark mode
+- "{ep.user_id} wants Slack notifications" → key: notification_channel, value: Slack
 
 OUTPUT JSON:
 {{
@@ -294,44 +300,45 @@ Return empty array if nothing qualifies."""
         else:
             scope_label = f"{scope_type}:{scope_id}"
 
-        # Pass 0: Local cache (fast path for same-session facts)
+        # Pass 0: Local cache (same-session facts) — never return alone.
+        # Pass 1: Mem0 currents with same concept key.
+        # Union both so zombies (two "current" same key) all get superseded.
         cached = self.semantic.find_in_recent(
             fact_key=cand.key,
             scope=scope_label,
         )
-        if cached:
-            logger.debug(
-                f"[find_existing] Cache hit for key='{cand.key}': "
-                f"{[f.fact_id[:8] for f in cached]}"
-            )
-            return cached
-
-        # Pass 1: Fetch all facts in scope, match on NORMALIZED key
         try:
             all_in_scope = self.semantic.get_all_facts(
                 scopes=[scope_label],
-                status=None,  # Get ALL facts (including superseded for debugging)
+                status=None,
             )
         except Exception as exc:
             logger.warning(f"[find_existing] get_all_facts failed: {exc}")
             all_in_scope = []
 
-        # Match using normalized key comparison
         key_matches = [
             f for f in all_in_scope
             if keys_are_same_concept(
                 f.metadata.get("fact_key", ""),
-                cand.key
+                cand.key,
             )
-            and f.status != "superseded"  # Exclude superseded from matching
+            and f.status != "superseded"
         ]
 
-        if key_matches:
+        by_id = {f.fact_id: f for f in key_matches}
+        for fact in cached:
+            if fact.status == "superseded":
+                continue
+            by_id[fact.fact_id] = fact
+        merged = list(by_id.values())
+
+        if merged:
             logger.debug(
-                f"[find_existing] Key match (normalized) for '{cand.key}': "
-                f"{[(f.fact_id[:8], f.metadata.get('fact_key'), f.status) for f in key_matches]}"
+                f"[find_existing] Key match for '{cand.key}': "
+                f"{[(f.fact_id[:8], f.metadata.get('fact_key'), f.status) for f in merged]}"
+                + (f" cache={[f.fact_id[:8] for f in cached]}" if cached else "")
             )
-            return key_matches
+            return merged
 
         # Pass 2: Content similarity fallback (for facts without fact_key metadata)
         try:
@@ -375,7 +382,17 @@ Return empty array if nothing qualifies."""
         - "supersede": replace existing fact(s) (key match, different value)
         """
         
-        # Hard gates - reject immediately
+        durable = jev_noul(
+            f"Fact: {cand.content}\nValue: {cand.value}\nEpisode: {ep.summary}",
+            "durable",
+            "Will this fact still be true next month?",
+            yes="Still true next month",
+            no="Temporary, or only true right now",
+        )
+        if durable is False:
+            return PolicyDecision("discard", "jev: not durable next month")
+
+        # Hard gates - reject immediately. Jev cannot override these.
         if cand.confidence < MIN_CONFIDENCE:
             return PolicyDecision(
                 "discard",
@@ -401,6 +418,11 @@ Return empty array if nothing qualifies."""
             )
         if not self._is_specific_enough(cand, ep):
             return PolicyDecision("discard", "not specific to user/agent/organization")
+        if not self._evidence_supports_candidate(cand, ep):
+            return PolicyDecision(
+                "discard",
+                "candidate value not grounded in episode evidence",
+            )
 
         # No existing fact - promote as new
         if not existing:
@@ -435,6 +457,36 @@ Return empty array if nothing qualifies."""
                 f"(superseding {len(key_matches)} existing)",
                 target=key_matches[0],
                 all_targets=key_matches,  # ✅ Mark ALL for supersession
+            )
+
+        # No key match. Jev may prioritize. Same-key merge/supersede stays in code above.
+        jev_action = jev_choice(
+            (
+                f"Candidate: {cand.content}\n"
+                f"Existing: {[fact.content for fact in existing]}\n"
+                "The value is already grounded. Choose only the storage action."
+            ),
+            "action",
+            "What should happen to this grounded fact?",
+            {
+                "promote": "store it as a new fact",
+                "merge": "reinforce an existing fact with the same meaning",
+                "supersede": "replace an existing fact with this new value",
+                "discard": "do not store it",
+            },
+        )
+        if jev_action == "discard":
+            return PolicyDecision("discard", "jev: not worth storing")
+        if jev_action == "promote":
+            return PolicyDecision("promote", "jev: new fact")
+        if jev_action == "merge" and existing:
+            return PolicyDecision("merge", "jev: reinforce", target=existing[0])
+        if jev_action == "supersede" and existing:
+            return PolicyDecision(
+                "supersede",
+                "jev: replace similar fact",
+                target=existing[0],
+                all_targets=existing,
             )
 
         # Content similarity fallback (no key match)
@@ -644,6 +696,38 @@ Return empty array if nothing qualifies."""
             return any(w in t for w in required)
         
         return False
+
+    def _evidence_supports_candidate(self, cand: Candidate, ep: EpisodeRecord) -> bool:
+        """
+        Heuristic grounding: candidate value (or clear tokens) must appear in
+        episode evidence / summary / goal / lessons. Blocks invented promotions.
+        Works for mixed Burmese+Latin (e.g. dark mode inside Myanmar sentence).
+        """
+        blob = " ".join(
+            [
+                cand.evidence or "",
+                ep.summary or "",
+                ep.goal or "",
+                " ".join(ep.lessons or []),
+                " ".join(ep.trajectory or []),
+            ]
+        ).lower()
+        if not blob.strip():
+            return False
+
+        value = (cand.value or "").strip().lower()
+        if value and value in blob:
+            return True
+
+        # Token overlap: keep alnum + Myanmar letters
+        value_tokens = set(re.findall(r"[a-z0-9\u1000-\u109f]{2,}", value))
+        # Drop tiny noise
+        value_tokens -= {"the", "a", "an", "is", "to", "of", "for", "and", "or"}
+        if not value_tokens:
+            # Non-latin-only value: require raw substring already checked; fail closed
+            return False
+        hits = sum(1 for tok in value_tokens if tok in blob)
+        return hits >= max(1, (len(value_tokens) + 1) // 2)
 
     def _values_equal(self, old_value: str, new_value: str) -> bool:
         """Check if two values are semantically equal."""

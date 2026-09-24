@@ -29,7 +29,7 @@ class SemanticFact(BaseModel):
 
 
 class SemanticMemory:
-    """Manages semantic facts using Mem0 Cloud API."""
+    """Mem0 Cloud implementation of SemanticStore."""
 
     def __init__(self):
         api_key = os.getenv("MEM0_API_KEY")

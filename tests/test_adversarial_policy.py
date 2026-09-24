@@ -39,7 +39,7 @@ def _cand(user_id, key, value, fact_type="preference", confidence=0.95, **kwargs
         value=value,
         scope_hint=kwargs.get("scope_hint", "user"),
         confidence=confidence,
-        evidence="adversarial",
+        evidence=kwargs.get("evidence") or f"user stated: {value}",
     )
 
 

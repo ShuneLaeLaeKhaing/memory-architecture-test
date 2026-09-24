@@ -20,7 +20,7 @@ load_dotenv(Path(__file__).parent / ".env")
 from config.agents import AGENT_CONFIGS
 from memory.event_capture import EventLogger
 from memory.consolidation import ConsolidationEngine
-from memory.semantic_memory import SemanticMemory
+from memory.semantic_factory import open_semantic_store
 from memory.procedural_memory import ProceduralMemory
 from memory.episodic_memory import EpisodicMemory
 from memory.knowledge_base import KnowledgeBase
@@ -45,7 +45,7 @@ class TerminalApp:
 
         self.event_logger = EventLogger()
         self.thread_manager = ThreadManager()
-        self.semantic_memory = SemanticMemory()
+        self.semantic_memory = open_semantic_store()
         self.procedural_memory = ProceduralMemory()
         self.episodic_memory = EpisodicMemory()
         self.knowledge_base = KnowledgeBase()

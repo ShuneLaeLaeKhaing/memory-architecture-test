@@ -7,9 +7,11 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from loguru import logger
 import openai
 
+from memory.jev_client import choice as jev_choice
 from memory.key_normalizer import normalize_key
 from memory.llm import llm_client, llm_model_fast, llm_no_thinking
-from memory.semantic_memory import SemanticMemory
+from memory.semantic_factory import open_semantic_store
+from memory.semantic_store import SemanticStore
 from memory.procedural_memory import ProceduralMemory
 from memory.episodic_memory import EpisodicMemory, _agent_aliases
 from memory.knowledge_base import KnowledgeBase
@@ -209,6 +211,20 @@ class IntentRouter:
 
     def route(self, query: str) -> Dict[str, Any]:
         """Maps query to primary and secondary memory channels."""
+        routed = jev_choice(
+            query,
+            "channel",
+            "Which memory should answer this?",
+            {
+                "semantic": "a stored preference, identity, or fact",
+                "episodic": "something from a past conversation",
+                "procedural": "how to do a company step",
+            },
+        )
+        if routed in _CHANNELS:
+            secondary = [name for name in _CHANNELS if name != routed]
+            return {"primary": routed, "secondary": secondary, "confidence": 0.8}
+
         prompt = (
             "Analyze the following user query for memory retrieval routing:\n\n"
             f"Query: \"{query}\"\n\n"
@@ -262,12 +278,12 @@ class MemoryRetriever:
 
     def __init__(
         self,
-        semantic: Optional[SemanticMemory] = None,
+        semantic: Optional[SemanticStore] = None,
         procedural: Optional[ProceduralMemory] = None,
         episodic: Optional[EpisodicMemory] = None,
         knowledge_base: Optional[KnowledgeBase] = None
     ):
-        self.semantic = semantic or SemanticMemory()
+        self.semantic: SemanticStore = semantic or open_semantic_store()
         self.procedural = procedural or ProceduralMemory()
         self.episodic = episodic or EpisodicMemory()
         self.knowledge_base = knowledge_base or KnowledgeBase()
@@ -380,12 +396,14 @@ class MemoryRetriever:
             user_id=user_id,
             scopes=semantic_recall_scopes(user_id, agent_id),
         )
-        return [
+        visible = [
             fact
             for fact in facts
             if scope_kind(getattr(fact, "scope", "") or "") != "user"
             or user_fact_visible_to_agent(fact, agent_id)
         ]
+        # Collapse same fact_key if zombies remain
+        return apply_semantic_authority(visible, user_id=user_id)
 
     def get_procedural_skills(self, scopes: List[str]):
         return self.procedural.get_all_skills(scopes=scopes)
